@@ -19,6 +19,7 @@
 
 #include "SDK/WBP_Race_HUD_Player01_classes.hpp"
 #include "SDK/WBP_Race_HUD_Player02_classes.hpp"
+#include "SDK/WBP_Race_HUD_Sub_Aming_classes.hpp"
 #include "SDK/WBP_Ready_M2_classes.hpp"
 #include "SDK/WBP_Ready_Sub_CharaWindow_P1P3_classes.hpp"
 #include "SDK/WBP_Ready_Sub_CharaWindow_P2P4_classes.hpp"
@@ -408,6 +409,7 @@ void HUD()
                     float heightOffset = (3840.0f / fAspectRatio - 2160.0f) / 2.0f;
 
                     if (sWidgetName.contains("WBP_Race_HUD_Player01_C")) {
+                        bIs2PlayerRace = false;
                         auto hud = static_cast<SDK::UWBP_Race_HUD_Player01_C*>(WidgetObject);
 
                         if (hud->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass())) {
@@ -467,6 +469,7 @@ void HUD()
                     }
 
                     if (sWidgetName.contains("WBP_Race_HUD_Player02_C")) {
+                        bIs2PlayerRace = true;
                         auto hud2P = static_cast<SDK::UWBP_Race_HUD_Player02_C*>(WidgetObject);
 
                         if (hud2P->WidgetTree && hud2P->WidgetTree->RootWidget && hud2P->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass())) {
@@ -533,12 +536,20 @@ void HUD()
 
                                 if (bFixHUD) {
                                     sizeBox->SetClipping(SDK::EWidgetClipping::Inherit);
+                                    if (hud2P->CanvasPanel_0) hud2P->CanvasPanel_0->SetClipping(SDK::EWidgetClipping::Inherit);
+                                    if (hud2P->CanvasPanel_P1_HUD) hud2P->CanvasPanel_P1_HUD->SetClipping(SDK::EWidgetClipping::Inherit);
+                                    if (hud2P->CanvasPanel_P2_HUD) hud2P->CanvasPanel_P2_HUD->SetClipping(SDK::EWidgetClipping::Inherit);
+                                    if (hud2P->WBP_Race_HUD_Sub_Aiming_P1) hud2P->WBP_Race_HUD_Sub_Aiming_P1->SetClipping(SDK::EWidgetClipping::Inherit);
+                                    if (hud2P->WBP_Race_HUD_Sub_Aiming_P2) hud2P->WBP_Race_HUD_Sub_Aiming_P2->SetClipping(SDK::EWidgetClipping::Inherit);
+                                    if (hud2P->WBP_Race_HUD_Sub_Targeted_P1) hud2P->WBP_Race_HUD_Sub_Targeted_P1->SetClipping(SDK::EWidgetClipping::Inherit);
+                                    if (hud2P->WBP_Race_HUD_Sub_Targeted_P2) hud2P->WBP_Race_HUD_Sub_Targeted_P2->SetClipping(SDK::EWidgetClipping::Inherit);
                                 }
                             }
                         }
                     }
 
                     if (sWidgetName.contains("WBP_Ready_M2_C")) {
+                        bIs2PlayerRace = true;
                         auto ready2P = static_cast<SDK::UWBP_Ready_M2_C*>(WidgetObject);
 
                         if (bDualMonitor2P && bMirror2PMenus && ready2P->WidgetTree && ready2P->WidgetTree->RootWidget && ready2P->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass())) {
@@ -624,6 +635,10 @@ void HUD()
                                 }
                             }
                         }
+                    }
+
+                    if (sWidgetName.contains("WBP_Ready_M1_C") || sWidgetName.contains("WBP_CMN_MainMenu") || sWidgetName.contains("WBP_Title")) {
+                        bIs2PlayerRace = false;
                     }
                 });
         }
