@@ -57,6 +57,7 @@ build/*
 *.out
 *.app
 *.asi
+*.zip
 
 # Visual Studio project/generated files
 *.sln

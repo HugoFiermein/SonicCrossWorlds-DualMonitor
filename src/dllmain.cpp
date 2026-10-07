@@ -27,6 +27,7 @@
 #include "SDK/WBP_Window_MachineParameter_classes.hpp"
 #include "SDK/WBP_PauseMenu_classes.hpp"
 #include "SDK/WBP_Popup_Window_classes.hpp"
+#include "SDK/WBP_Result_GP_Player0204_classes.hpp"
 
 HMODULE exeModule = GetModuleHandle(NULL);
 HMODULE thisModule;
@@ -402,7 +403,7 @@ void HUD()
                     if (WidgetObject != obj) {
                         WidgetObject = obj;
                         sWidgetName = WidgetObject->GetName();
-                        SPDLOG_DEBUG("HUD: Widgets: {} @ 0x{:x}", sWidgetName, reinterpret_cast<uintptr_t>(WidgetObject));
+                        SPDLOG_INFO("HUD: Widgets: {} @ 0x{:x}", sWidgetName, reinterpret_cast<uintptr_t>(WidgetObject));
                     }
 
                     float widthOffset = (2160.0f * fAspectRatio - 3840.0f) / 2.0f;
@@ -552,87 +553,142 @@ void HUD()
                         bIs2PlayerRace = true;
                         auto ready2P = static_cast<SDK::UWBP_Ready_M2_C*>(WidgetObject);
 
-                        if (bDualMonitor2P && bMirror2PMenus && ready2P->WidgetTree && ready2P->WidgetTree->RootWidget && ready2P->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass())) {
-                            auto scaleBox = static_cast<SDK::UScaleBox*>(ready2P->WidgetTree->RootWidget);
-                            if (scaleBox->Slots.IsValidIndex(0) && scaleBox->Slots[0]->Content) {
-                                auto sizeBox = static_cast<SDK::USizeBox*>(scaleBox->Slots[0]->Content);
+                        if (bDualMonitor2P && bMirror2PMenus) {
+                            SPDLOG_INFO("HUD: Applying Dual-Monitor layout to WBP_Ready_M2_C");
 
-                                if (fAspectRatio > fNativeAspect) {
-                                    sizeBox->SetWidthOverride(2160.0f * fAspectRatio);
-                                    sizeBox->SetHeightOverride(2160.0f);
+                            auto unclipAndExpand = [](SDK::UWidget* w, auto& self) -> void {
+                                if (!w) return;
+                                w->SetClipping(SDK::EWidgetClipping::Inherit);
+                                if (w->IsA(SDK::USafeZone::StaticClass())) {
+                                    static_cast<SDK::USafeZone*>(w)->SetSidesToPad(false, false, false, false);
                                 }
-                                else {
-                                    sizeBox->SetWidthOverride(3840.0f);
-                                    sizeBox->SetHeightOverride(3840.0f / fAspectRatio);
+                                if (w->IsA(SDK::USizeBox::StaticClass())) {
+                                    auto sb = static_cast<SDK::USizeBox*>(w);
+                                    sb->SetWidthOverride(3840.0f);
+                                    sb->SetHeightOverride(1080.0f);
                                 }
-                                sizeBox->SetClipping(SDK::EWidgetClipping::Inherit);
+                                if (w->IsA(SDK::UPanelWidget::StaticClass())) {
+                                    auto p = static_cast<SDK::UPanelWidget*>(w);
+                                    for (int i = 0; i < p->Slots.Num(); ++i) {
+                                        if (p->Slots.IsValidIndex(i) && p->Slots[i] && p->Slots[i]->Content) {
+                                            self(p->Slots[i]->Content, self);
+                                        }
+                                    }
+                                }
+                            };
 
-                                SDK::FAnchors anchorsP1{ SDK::FVector2D{ 0.0, 0.0 }, SDK::FVector2D{ 0.5, 1.0 } };
-                                SDK::FAnchors anchorsP2{ SDK::FVector2D{ 0.5, 0.0 }, SDK::FVector2D{ 1.0, 1.0 } };
+                            if (ready2P->WidgetTree && ready2P->WidgetTree->RootWidget) {
+                                unclipAndExpand(ready2P->WidgetTree->RootWidget, unclipAndExpand);
+                            }
+                            if (ready2P->SafeZone_Ready_M2) {
+                                ready2P->SafeZone_Ready_M2->SetSidesToPad(false, false, false, false);
+                                unclipAndExpand(ready2P->SafeZone_Ready_M2, unclipAndExpand);
+                            }
 
-                                // P1 Elements -> Left Monitor (0.0 to 0.5)
-                                if (ready2P->Base_BG_P1 && ready2P->Base_BG_P1->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->Base_BG_P1->Slot);
-                                    slot->SetAnchors(anchorsP1);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->Base_BG_Shadow_P1 && ready2P->Base_BG_Shadow_P1->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->Base_BG_Shadow_P1->Slot);
-                                    slot->SetAnchors(anchorsP1);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->RaceFlag_Left_P1 && ready2P->RaceFlag_Left_P1->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->RaceFlag_Left_P1->Slot);
-                                    slot->SetAnchors(anchorsP1);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->WBP_Ready_Sub_CharaWindow_P1P3 && ready2P->WBP_Ready_Sub_CharaWindow_P1P3->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->WBP_Ready_Sub_CharaWindow_P1P3->Slot);
-                                    slot->SetAnchors(anchorsP1);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->WBP_Ready_Sub_Gadget_P1 && ready2P->WBP_Ready_Sub_Gadget_P1->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->WBP_Ready_Sub_Gadget_P1->Slot);
-                                    slot->SetAnchors(anchorsP1);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->WBP_Window_MachineParameter_P1 && ready2P->WBP_Window_MachineParameter_P1->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->WBP_Window_MachineParameter_P1->Slot);
-                                    slot->SetAnchors(anchorsP1);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
+                            // Fullscreen backgrounds
+                            SDK::FAnchors anchorsFull{ SDK::FVector2D{ 0.0, 0.0 }, SDK::FVector2D{ 1.0, 1.0 } };
+                            if (ready2P->BG_Black && ready2P->BG_Black->Slot && ready2P->BG_Black->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->BG_Black->Slot);
+                                slot->SetAnchors(anchorsFull);
+                                slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+                            }
+                            if (ready2P->BG_Light && ready2P->BG_Light->Slot && ready2P->BG_Light->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->BG_Light->Slot);
+                                slot->SetAnchors(anchorsFull);
+                                slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+                            }
 
-                                // P2 Elements -> Right Monitor (0.5 to 1.0)
-                                if (ready2P->Base_BG_P2 && ready2P->Base_BG_P2->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->Base_BG_P2->Slot);
-                                    slot->SetAnchors(anchorsP2);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->Base_BG_Shadow_P2 && ready2P->Base_BG_Shadow_P2->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->Base_BG_Shadow_P2->Slot);
-                                    slot->SetAnchors(anchorsP2);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->RaceFlag_Right_P2 && ready2P->RaceFlag_Right_P2->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->RaceFlag_Right_P2->Slot);
-                                    slot->SetAnchors(anchorsP2);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->WBP_Ready_Sub_CharaWindow_P2P4 && ready2P->WBP_Ready_Sub_CharaWindow_P2P4->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->WBP_Ready_Sub_CharaWindow_P2P4->Slot);
-                                    slot->SetAnchors(anchorsP2);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->WBP_Ready_Sub_Gadget_P2 && ready2P->WBP_Ready_Sub_Gadget_P2->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->WBP_Ready_Sub_Gadget_P2->Slot);
-                                    slot->SetAnchors(anchorsP2);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
-                                if (ready2P->WBP_Window_MachineParameter_P2 && ready2P->WBP_Window_MachineParameter_P2->Slot) {
-                                    auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->WBP_Window_MachineParameter_P2->Slot);
-                                    slot->SetAnchors(anchorsP2);
-                                    slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
-                                }
+                            // P1 Elements -> Left Monitor (0.0 to 0.5)
+                            SDK::FAnchors anchorsP1{ SDK::FVector2D{ 0.0, 0.0 }, SDK::FVector2D{ 0.5, 1.0 } };
+                            if (ready2P->Base_BG_P1 && ready2P->Base_BG_P1->Slot && ready2P->Base_BG_P1->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->Base_BG_P1->Slot);
+                                slot->SetAnchors(anchorsP1);
+                                slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+                            }
+                            if (ready2P->Base_BG_Shadow_P1 && ready2P->Base_BG_Shadow_P1->Slot && ready2P->Base_BG_Shadow_P1->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->Base_BG_Shadow_P1->Slot);
+                                slot->SetAnchors(anchorsP1);
+                                slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+                            }
+                            if (ready2P->RaceFlag_Left_P1 && ready2P->RaceFlag_Left_P1->Slot && ready2P->RaceFlag_Left_P1->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->RaceFlag_Left_P1->Slot);
+                                slot->SetAnchors(anchorsP1);
+                                slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+                            }
+
+                            // P2 Elements -> Right Monitor (0.5 to 1.0)
+                            SDK::FAnchors anchorsP2{ SDK::FVector2D{ 0.5, 0.0 }, SDK::FVector2D{ 1.0, 1.0 } };
+                            if (ready2P->Base_BG_P2 && ready2P->Base_BG_P2->Slot && ready2P->Base_BG_P2->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->Base_BG_P2->Slot);
+                                slot->SetAnchors(anchorsP2);
+                                slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+                            }
+                            if (ready2P->Base_BG_Shadow_P2 && ready2P->Base_BG_Shadow_P2->Slot && ready2P->Base_BG_Shadow_P2->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->Base_BG_Shadow_P2->Slot);
+                                slot->SetAnchors(anchorsP2);
+                                slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+                            }
+                            if (ready2P->RaceFlag_Right_P2 && ready2P->RaceFlag_Right_P2->Slot && ready2P->RaceFlag_Right_P2->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(ready2P->RaceFlag_Right_P2->Slot);
+                                slot->SetAnchors(anchorsP2);
+                                slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+                            }
+
+                            // Position interactive selection windows:
+                            // P1 to Monitor 1 (Left), P2 to Monitor 2 (Right)
+                            auto setupP1Window = [](SDK::UWidget* w) {
+                                if (!w) return;
+                                w->SetClipping(SDK::EWidgetClipping::Inherit);
+                                w->SetRenderTranslation(SDK::FVector2D{ -480.0, 0.0 });
+                            };
+
+                            auto setupP2Window = [](SDK::UWidget* w) {
+                                if (!w) return;
+                                w->SetClipping(SDK::EWidgetClipping::Inherit);
+                                w->SetRenderTranslation(SDK::FVector2D{ 480.0, 0.0 });
+                            };
+
+                            setupP1Window(ready2P->WBP_Ready_Sub_CharaWindow_P1P3);
+                            setupP1Window(ready2P->WBP_Ready_Sub_Gadget_P1);
+                            setupP1Window(ready2P->WBP_Window_MachineParameter_P1);
+
+                            setupP2Window(ready2P->WBP_Ready_Sub_CharaWindow_P2P4);
+                            setupP2Window(ready2P->WBP_Ready_Sub_Gadget_P2);
+                            setupP2Window(ready2P->WBP_Window_MachineParameter_P2);
+                        }
+                    }
+
+                    if (sWidgetName.contains("WBP_PauseMenu_C")) {
+                        auto pauseMenu = static_cast<SDK::UWBP_PauseMenu_C*>(WidgetObject);
+                        if (bDualMonitor2P && bMirror2PMenus) {
+                            SPDLOG_INFO("HUD: Applying Dual-Monitor layout to WBP_PauseMenu_C");
+                            if (pauseMenu->WidgetTree && pauseMenu->WidgetTree->RootWidget) {
+                                pauseMenu->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
+                            }
+
+                            // Player 1 pause elements -> Monitor 1 (-480 shift)
+                            if (pauseMenu->Overlay_Option_Btn_03_P1) pauseMenu->Overlay_Option_Btn_03_P1->SetRenderTranslation(SDK::FVector2D{ -480.0, 0.0 });
+                            if (pauseMenu->WidgetSwitcher_P1) pauseMenu->WidgetSwitcher_P1->SetRenderTranslation(SDK::FVector2D{ -480.0, 0.0 });
+
+                            // Player 2 pause elements -> Monitor 2 (+480 shift)
+                            if (pauseMenu->Overlay_Option_Btn_03_P2) pauseMenu->Overlay_Option_Btn_03_P2->SetRenderTranslation(SDK::FVector2D{ 480.0, 0.0 });
+                            if (pauseMenu->WidgetSwitcher_P2) pauseMenu->WidgetSwitcher_P2->SetRenderTranslation(SDK::FVector2D{ 480.0, 0.0 });
+
+                            // Pause buttons: if P2 paused, place on Monitor 2 (+480), otherwise on Monitor 1 (-480)
+                            if (pauseMenu->VBButton) {
+                                float shift = (pauseMenu->Owner_Player_Index == 1) ? 480.0f : -480.0f;
+                                pauseMenu->VBButton->SetRenderTranslation(SDK::FVector2D{ shift, 0.0 });
+                            }
+                        }
+                    }
+
+                    if (bDualMonitor2P && bMirror2PMenus && bIs2PlayerRace) {
+                        if (sWidgetName.contains("ClassSelect") || sWidgetName.contains("CourseSelect") || sWidgetName.contains("RivalSelect")) {
+                            auto widget = static_cast<SDK::UUserWidget*>(WidgetObject);
+                            SPDLOG_INFO("HUD: Centering shared menu {} on Monitor 1", sWidgetName);
+                            if (widget->WidgetTree && widget->WidgetTree->RootWidget) {
+                                widget->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
+                                widget->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ -960.0f, 0.0f });
                             }
                         }
                     }
