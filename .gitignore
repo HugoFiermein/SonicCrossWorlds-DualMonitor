@@ -1,0 +1,99 @@
+.xmake/*
+build/*
+
+**/.vs/
+
+**/.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# Local History for Visual Studio Code
+.history/
+
+# Built Visual Studio Code Extensions
+*.vsix
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+*.idb
+*.res
+*.tlog
+*.log
+*.lastbuildstate
+*.cachefile
+
+# Precompiled Headers
+*.gch
+*.pch
+*.ipch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+*.exp
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+*.asi
+
+# Visual Studio project/generated files
+*.sln
+*.vcxproj
+*.filters
+*.props
+*.items
+*.targets
+*.user
+*.aps
+
+# Debug / symbol files
+*.pdb
+*.ilk
+
+# IntelliSense / database files
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.VC.db-shm
+*.VC.db-wal
+*.suo
+*.sln.docstates
+
+# Crash dumps
+*.dmp
+
+# Local helper scripts
+make_vs_sln.bat
+
+# wxWidgets build artifacts
+.build_wx/
+
+# 7zip build artifacts
+.7zip/
+
+# zydis build artifacts
+.build_zydis/
