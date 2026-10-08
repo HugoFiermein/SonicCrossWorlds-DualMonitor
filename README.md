@@ -15,13 +15,13 @@ Instead of splitting a single monitor in half, each player gets their own dedica
 - **Player 2 (Right Monitor)**: Full viewport and isolated Player 2 HUD on the right screen (50% – 100% of 32:9).
 - **Hides Center Divider**: Removes the game's default black vertical divider bar so it does not collide with your physical monitor bezels.
 
-### 📋 Dual-Monitor Menu Separation
-- **2P Character & Vehicle Select (`WBP_Ready_M2`)**: Player 1's racer setup, stats, and gadget windows are centered cleanly on Monitor 1. Player 2's windows are centered cleanly on Monitor 2. No menu elements are cut in half by monitor bezels!
-- **Pause Menu (`WBP_PauseMenu_C`)**: Options and player stats are distributed to each player's monitor; pause action buttons appear centered on the screen of the player who paused.
-- **Shared Menus**: Class and Course selection screens are cleanly aligned on Monitor 1 rather than being split down the middle by the bezel.
+### 📋 Dual-Monitor Menu & Intro Duplication
+- **Menu & Intro Mirroring**: All shared menus (`CourseSelect`, `ClassSelect`, `RivalSelect`, `RivalCutin`, `RivalChoice`) and pre-race intros (`RaceBefore_*`) are mirrored across both monitors so neither player gets a black screen and nothing is sliced in half by monitor bezels!
+- **2P Racer Setup (`WBP_Ready_M2`)**: Player 1's racer cards, vehicle parameters, and gadget selections are centered cleanly on Monitor 1. Player 2's are centered on Monitor 2. The "ВПЕРЁД!" (GO!) banner is rendered cleanly on each monitor.
+- **Pause Menu (`WBP_PauseMenu_C`)**: Full-screen blur spans both monitors without pillarbox seams; pause dialog and buttons appear centered on the screen of the player who paused, with player stats mapped to each respective screen.
 
-### 🎯 Fixed Forward Attack Aim / Reticle
-- Fixes the bug where only the right half of the forward-attack aiming reticle was rendered in split-screen mode due to incorrect world-to-screen coordinate offsets. The reticle is now fully visible and accurately positioned.
+### 🎯 Restored Forward Attack Aim / Reticle
+- Completely fixes the aiming reticle in 2-player mode. Bypasses single-player ultrawide offset shifts that displaced the reticle to the screen edge and restores native 1:1 pixel HUD canvas scaling, ensuring the reticle is fully visible and tracks directly in front of the car.
 
 ---
 
@@ -29,7 +29,7 @@ Instead of splitting a single monitor in half, each player gets their own dedica
 
 Installation requires just **1 simple step**:
 
-1. Download the latest release: [**`CrossWorldsFix-DualMonitor-v0.0.3.zip`**](https://github.com/HugoFiermein/CrossWorldsFix/releases/latest).
+1. Download the latest release: [**`CrossWorldsFix-DualMonitor-v0.0.4.zip`**](https://github.com/HugoFiermein/CrossWorldsFix/releases/latest).
 2. Extract the 3 files directly into your game's executable directory:
    ```
    SonicRacingCrossWorlds\UNION\Binaries\Win64\
