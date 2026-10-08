@@ -29,7 +29,7 @@ Instead of splitting a single monitor in half, each player gets their own dedica
 
 Installation requires just **1 simple step**:
 
-1. Download the latest release: [**`CrossWorldsFix-DualMonitor-v0.0.4.zip`**](https://github.com/HugoFiermein/CrossWorldsFix/releases/latest).
+1. Download the latest release: [**`CrossWorldsFix-DualMonitor-v0.0.4.zip`**](https://github.com/HugoFiermein/SonicCrossWorlds-DualMonitor/releases/latest).
 2. Extract the 3 files directly into your game's executable directory:
    ```
    SonicRacingCrossWorlds\UNION\Binaries\Win64\

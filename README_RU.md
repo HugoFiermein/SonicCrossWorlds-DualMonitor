@@ -29,7 +29,7 @@
 
 Установка предельно простая и состоит из **1 действия**:
 
-1. Скачайте свежий архив релиза: [**`CrossWorldsFix-DualMonitor-v0.0.4.zip`**](https://github.com/HugoFiermein/CrossWorldsFix/releases/latest).
+1. Скачайте свежий архив релиза: [**`CrossWorldsFix-DualMonitor-v0.0.4.zip`**](https://github.com/HugoFiermein/SonicCrossWorlds-DualMonitor/releases/latest).
 2. Распакуйте 3 файла из архива прямо в папку с игрой, где лежит исполняемый файл:
    ```
    SonicRacingCrossWorlds\UNION\Binaries\Win64\
