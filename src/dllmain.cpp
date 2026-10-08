@@ -571,6 +571,61 @@ void HUD()
                         }
                     }
 
+                    if (sWidgetName.contains("WBP_MachineCharaSelect_M2") || WidgetObject->IsA(SDK::UCharaMachineSelectsBase::StaticClass())) {
+                        bIs2PlayerRace = true;
+                        auto charaSelects = static_cast<SDK::UCharaMachineSelectsBase*>(WidgetObject);
+
+                        if (bDualMonitor2P && bMirror2PMenus) {
+                            SPDLOG_INFO("HUD: Applying Dual-Monitor layout to WBP_MachineCharaSelect_M2");
+
+                            auto unclipAndExpand = [](SDK::UWidget* w, auto& self) -> void {
+                                if (!w) return;
+                                w->SetClipping(SDK::EWidgetClipping::Inherit);
+                                if (w->IsA(SDK::USafeZone::StaticClass())) {
+                                    static_cast<SDK::USafeZone*>(w)->SetSidesToPad(false, false, false, false);
+                                }
+                                if (w->IsA(SDK::USizeBox::StaticClass())) {
+                                    auto sb = static_cast<SDK::USizeBox*>(w);
+                                    sb->SetWidthOverride(3840.0f);
+                                    sb->SetHeightOverride(1080.0f);
+                                }
+                                if (w->IsA(SDK::UPanelWidget::StaticClass())) {
+                                    auto p = static_cast<SDK::UPanelWidget*>(w);
+                                    for (int i = 0; i < p->Slots.Num(); ++i) {
+                                        if (p->Slots.IsValidIndex(i) && p->Slots[i] && p->Slots[i]->Content) {
+                                            self(p->Slots[i]->Content, self);
+                                        }
+                                    }
+                                }
+                            };
+
+                            if (charaSelects->WidgetTree && charaSelects->WidgetTree->RootWidget) {
+                                unclipAndExpand(charaSelects->WidgetTree->RootWidget, unclipAndExpand);
+                            }
+
+                            // CharaMachineSelectList: player machine/parameter windows
+                            // Index 0 = P1 -> Monitor 1 (-960.0), Index 1 = P2 -> Monitor 2 (+960.0)
+                            if (charaSelects->CharaMachineSelectList.IsValidIndex(0) && charaSelects->CharaMachineSelectList[0]) {
+                                charaSelects->CharaMachineSelectList[0]->SetClipping(SDK::EWidgetClipping::Inherit);
+                                charaSelects->CharaMachineSelectList[0]->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+                            }
+                            if (charaSelects->CharaMachineSelectList.IsValidIndex(1) && charaSelects->CharaMachineSelectList[1]) {
+                                charaSelects->CharaMachineSelectList[1]->SetClipping(SDK::EWidgetClipping::Inherit);
+                                charaSelects->CharaMachineSelectList[1]->SetRenderTranslation(SDK::FVector2D{ 960.0, 0.0 });
+                            }
+
+                            // Shared character icon grid: place on Monitor 1 (-960.0)
+                            if (charaSelects->WBP_CharaSelect_Sub_Window) {
+                                charaSelects->WBP_CharaSelect_Sub_Window->SetClipping(SDK::EWidgetClipping::Inherit);
+                                charaSelects->WBP_CharaSelect_Sub_Window->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+                            }
+
+                            if (charaSelects->WBP_CMN_GadgetCount) {
+                                charaSelects->WBP_CMN_GadgetCount->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+                            }
+                        }
+                    }
+
                     if (sWidgetName.contains("WBP_Ready_M2_C")) {
                         bIs2PlayerRace = true;
                         auto ready2P = static_cast<SDK::UWBP_Ready_M2_C*>(WidgetObject);
@@ -762,7 +817,7 @@ void HUD()
                         }
                     }
 
-                    if (bDualMonitor2P && bMirror2PMenus && bIs2PlayerRace && !bIsMenuCloning) {
+                    if (bDualMonitor2P && bMirror2PMenus && bIs2PlayerRace) {
                         bool bIsSharedMenu = sWidgetName.contains("ClassSelect") ||
                                              sWidgetName.contains("CourseSelect") ||
                                              sWidgetName.contains("RivalSelect") ||
@@ -772,28 +827,10 @@ void HUD()
 
                         if (bIsSharedMenu) {
                             auto widget = static_cast<SDK::UUserWidget*>(WidgetObject);
-                            SPDLOG_INFO("HUD: Dual-Monitor shared menu mirroring for {}", sWidgetName);
+                            SPDLOG_INFO("HUD: Dual-Monitor shared menu centering for {}", sWidgetName);
                             if (widget->WidgetTree && widget->WidgetTree->RootWidget) {
                                 widget->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
                                 widget->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ -960.0f, 0.0f });
-
-                                if (pCurrentMenuClone) {
-                                    pCurrentMenuClone->RemoveFromParent();
-                                    pCurrentMenuClone = nullptr;
-                                }
-
-                                bIsMenuCloning = true;
-                                auto clone = SDK::UWidgetBlueprintLibrary::Create(widget, widget->Class, nullptr);
-                                bIsMenuCloning = false;
-                                if (clone) {
-                                    clone->AddToViewport(0);
-                                    clone->SetVisibility(SDK::ESlateVisibility::HitTestInvisible);
-                                    if (clone->WidgetTree && clone->WidgetTree->RootWidget) {
-                                        clone->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
-                                        clone->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ 960.0f, 0.0f });
-                                    }
-                                    pCurrentMenuClone = clone;
-                                }
                             }
                         }
                     }
