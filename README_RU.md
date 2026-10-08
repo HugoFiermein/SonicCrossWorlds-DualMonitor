@@ -83,7 +83,7 @@ Enabled = true               ; Исправляет масштаб интерф�
 
 ## Благодарности и используемые компоненты
 
-- **[Lyall](https://codeberg.org/Lyall/CrossWorldsFix)** — Авторы оригинального мода CrossWorldsFix, реверс-инжиниринг и поиск сигнатур в памяти игры.
+- **[Lyall](https://codeberg.org/Lyall/CrossWorldsFix)** — Автор оригинального мода CrossWorldsFix, реверс-инжиниринг и поиск сигнатур в памяти игры.
 - **[Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)** от ThirteenAG — Загрузчик ASI-плагинов (`winmm.dll`).
 - **[safetyhook](https://github.com/cursey/safetyhook)** — Библиотека для создания хуков в памяти.
 - **[Dumper-7](https://github.com/Encryqed/Dumper-7)** — Инструмент генерации SDK Unreal Engine.
