@@ -28,6 +28,12 @@
 #include "SDK/WBP_PauseMenu_classes.hpp"
 #include "SDK/WBP_Popup_Window_classes.hpp"
 #include "SDK/WBP_Result_GP_Player0204_classes.hpp"
+#include "SDK/WBP_Ready_Sub_Decide_classes.hpp"
+#include "SDK/WBP_Ready_Sub_StandByText_classes.hpp"
+#include "SDK/WBP_CMN_Sub_BoxBtn_classes.hpp"
+#include "SDK/WBP_CMN_PlayerNumber_Big_classes.hpp"
+#include "SDK/WBP_FooterMenu_classes.hpp"
+#include "SDK/WBP_GadgetCustom_Sub_GadgetPlate_classes.hpp"
 
 HMODULE exeModule = GetModuleHandle(NULL);
 HMODULE thisModule;
@@ -283,26 +289,29 @@ void HUD()
 {
     if (bFixHUD) 
     {
-        // Fix racing position markers
-        std::uint8_t* ProjectWorldToScreenScanResult = Memory::PatternScan(exeModule, "48 ?? ?? 20 F2 0F ?? ?? 66 0F ?? ?? F3 0F ?? ?? F2 0F ?? ?? F2 0F ?? ?? ?? F2 0F ?? ?? F2 0F ?? ?? ?? 84 ??");
-        if (ProjectWorldToScreenScanResult) {
-            SPDLOG_INFO("HUD: Project World To Screen: Address is {:s}+{:x}", sExeName.c_str(), ProjectWorldToScreenScanResult - reinterpret_cast<std::uint8_t*>(exeModule));
-            static SafetyHookMid ProjectWorldToScreenWidthMidHook{};
-            ProjectWorldToScreenWidthMidHook = safetyhook::create_mid(ProjectWorldToScreenScanResult,
-                [](SafetyHookContext& ctx) {
-                    if (!bSpanRaceHUD && !(bDualMonitor2P && bIs2PlayerRace) && fAspectRatio > fNativeAspect)
-                        ctx.xmm0.f64[0] = fHUDWidthOffset;
-                });
+        // Fix racing position markers for single-player ultrawide only.
+        // DO NOT hook for Dual Monitor 2P mode, as native UE split-screen already has 16:9 viewports per screen!
+        if (!bDualMonitor2P) {
+            std::uint8_t* ProjectWorldToScreenScanResult = Memory::PatternScan(exeModule, "48 ?? ?? 20 F2 0F ?? ?? 66 0F ?? ?? F3 0F ?? ?? F2 0F ?? ?? F2 0F ?? ?? ?? F2 0F ?? ?? F2 0F ?? ?? ?? 84 ??");
+            if (ProjectWorldToScreenScanResult) {
+                SPDLOG_INFO("HUD: Project World To Screen: Address is {:s}+{:x}", sExeName.c_str(), ProjectWorldToScreenScanResult - reinterpret_cast<std::uint8_t*>(exeModule));
+                static SafetyHookMid ProjectWorldToScreenWidthMidHook{};
+                ProjectWorldToScreenWidthMidHook = safetyhook::create_mid(ProjectWorldToScreenScanResult,
+                    [](SafetyHookContext& ctx) {
+                        if (!bSpanRaceHUD && fAspectRatio > fNativeAspect)
+                            ctx.xmm0.f64[0] = fHUDWidthOffset;
+                    });
 
-            static SafetyHookMid ProjectWorldToScreenHeightMidHook{};
-            ProjectWorldToScreenHeightMidHook = safetyhook::create_mid(ProjectWorldToScreenScanResult + 0x10,
-                [](SafetyHookContext& ctx) {
-                    if (!bSpanRaceHUD && !(bDualMonitor2P && bIs2PlayerRace) && fAspectRatio < fNativeAspect)
-                        ctx.xmm0.f64[0] = fHUDHeightOffset;
-                });
-        }
-        else {
-            SPDLOG_ERROR("HUD: Project World To Screen: Pattern scan failed.");
+                static SafetyHookMid ProjectWorldToScreenHeightMidHook{};
+                ProjectWorldToScreenHeightMidHook = safetyhook::create_mid(ProjectWorldToScreenScanResult + 0x10,
+                    [](SafetyHookContext& ctx) {
+                        if (!bSpanRaceHUD && fAspectRatio < fNativeAspect)
+                            ctx.xmm0.f64[0] = fHUDHeightOffset;
+                    });
+            }
+            else {
+                SPDLOG_ERROR("HUD: Project World To Screen: Pattern scan failed.");
+            }
         }
 
         // Fades
@@ -469,8 +478,27 @@ void HUD()
                         }
                     }
 
+                    static bool bIsMenuCloning = false;
+                    static SDK::UUserWidget* pCurrentMenuClone = nullptr;
+
+                    if (sWidgetName.contains("_M2") || sWidgetName.contains("Player02")) {
+                        bIs2PlayerRace = true;
+                    }
+
+                    if (sWidgetName.contains("WBP_Ready_M1_C") || sWidgetName.contains("WBP_CMN_MainMenu") || sWidgetName.contains("WBP_TitleMenu") || sWidgetName.contains("WBP_TopMenu")) {
+                        bIs2PlayerRace = false;
+                        if (pCurrentMenuClone) {
+                            pCurrentMenuClone->RemoveFromParent();
+                            pCurrentMenuClone = nullptr;
+                        }
+                    }
+
                     if (sWidgetName.contains("WBP_Race_HUD_Player02_C")) {
                         bIs2PlayerRace = true;
+                        if (pCurrentMenuClone) {
+                            pCurrentMenuClone->RemoveFromParent();
+                            pCurrentMenuClone = nullptr;
+                        }
                         auto hud2P = static_cast<SDK::UWBP_Race_HUD_Player02_C*>(WidgetObject);
 
                         if (hud2P->WidgetTree && hud2P->WidgetTree->RootWidget && hud2P->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass())) {
@@ -479,14 +507,8 @@ void HUD()
                                 auto sizeBox = static_cast<SDK::USizeBox*>(scaleBox->Slots[0]->Content);
 
                                 if (bDualMonitor2P || bSpanRaceHUD) {
-                                    if (fAspectRatio > fNativeAspect) {
-                                        sizeBox->SetWidthOverride(2160.0f * fAspectRatio);
-                                        sizeBox->SetHeightOverride(2160.0f);
-                                    }
-                                    else {
-                                        sizeBox->SetWidthOverride(3840.0f);
-                                        sizeBox->SetHeightOverride(3840.0f / fAspectRatio);
-                                    }
+                                    sizeBox->SetWidthOverride((float)iCurrentResX);
+                                    sizeBox->SetHeightOverride((float)iCurrentResY);
 
                                     SDK::FAnchors anchorsP1{ SDK::FVector2D{ 0.0, 0.0 }, SDK::FVector2D{ 0.5, 1.0 } };
                                     SDK::FAnchors anchorsP2{ SDK::FVector2D{ 0.5, 0.0 }, SDK::FVector2D{ 1.0, 1.0 } };
@@ -634,18 +656,18 @@ void HUD()
                                 slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
                             }
 
-                            // Position interactive selection windows:
-                            // P1 to Monitor 1 (Left), P2 to Monitor 2 (Right)
+                            // Position interactive selection cards:
+                            // P1 to Monitor 1 (-960.0), P2 to Monitor 2 (+960.0)
                             auto setupP1Window = [](SDK::UWidget* w) {
                                 if (!w) return;
                                 w->SetClipping(SDK::EWidgetClipping::Inherit);
-                                w->SetRenderTranslation(SDK::FVector2D{ -480.0, 0.0 });
+                                w->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
                             };
 
                             auto setupP2Window = [](SDK::UWidget* w) {
                                 if (!w) return;
                                 w->SetClipping(SDK::EWidgetClipping::Inherit);
-                                w->SetRenderTranslation(SDK::FVector2D{ 480.0, 0.0 });
+                                w->SetRenderTranslation(SDK::FVector2D{ 960.0, 0.0 });
                             };
 
                             setupP1Window(ready2P->WBP_Ready_Sub_CharaWindow_P1P3);
@@ -655,6 +677,35 @@ void HUD()
                             setupP2Window(ready2P->WBP_Ready_Sub_CharaWindow_P2P4);
                             setupP2Window(ready2P->WBP_Ready_Sub_Gadget_P2);
                             setupP2Window(ready2P->WBP_Window_MachineParameter_P2);
+
+                            // Standby text and buttons on Monitor 1
+                            if (ready2P->WBP_Ready_Sub_StandByText) {
+                                ready2P->WBP_Ready_Sub_StandByText->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+                            }
+                            if (ready2P->WBP_CMN_Sub_BoxBtn) {
+                                ready2P->WBP_CMN_Sub_BoxBtn->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+                            }
+
+                            // "ВПЕРЁД!" banner: Monitor 1 primary (-960) and clone to Monitor 2 (+960)
+                            if (ready2P->WBP_Ready_Sub_Decide) {
+                                ready2P->WBP_Ready_Sub_Decide->SetClipping(SDK::EWidgetClipping::Inherit);
+                                ready2P->WBP_Ready_Sub_Decide->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+
+                                if (!bIsMenuCloning && ready2P->WBP_Ready_Sub_Decide->Class) {
+                                    bIsMenuCloning = true;
+                                    auto decideClone = SDK::UWidgetBlueprintLibrary::Create(ready2P, ready2P->WBP_Ready_Sub_Decide->Class, nullptr);
+                                    bIsMenuCloning = false;
+                                    if (decideClone) {
+                                        decideClone->AddToViewport(10);
+                                        decideClone->SetVisibility(SDK::ESlateVisibility::HitTestInvisible);
+                                        if (decideClone->WidgetTree && decideClone->WidgetTree->RootWidget) {
+                                            decideClone->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
+                                            decideClone->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ 960.0, 0.0 });
+                                        }
+                                        pCurrentMenuClone = decideClone;
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -666,35 +717,85 @@ void HUD()
                                 pauseMenu->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
                             }
 
-                            // Player 1 pause elements -> Monitor 1 (-480 shift)
-                            if (pauseMenu->Overlay_Option_Btn_03_P1) pauseMenu->Overlay_Option_Btn_03_P1->SetRenderTranslation(SDK::FVector2D{ -480.0, 0.0 });
-                            if (pauseMenu->WidgetSwitcher_P1) pauseMenu->WidgetSwitcher_P1->SetRenderTranslation(SDK::FVector2D{ -480.0, 0.0 });
-
-                            // Player 2 pause elements -> Monitor 2 (+480 shift)
-                            if (pauseMenu->Overlay_Option_Btn_03_P2) pauseMenu->Overlay_Option_Btn_03_P2->SetRenderTranslation(SDK::FVector2D{ 480.0, 0.0 });
-                            if (pauseMenu->WidgetSwitcher_P2) pauseMenu->WidgetSwitcher_P2->SetRenderTranslation(SDK::FVector2D{ 480.0, 0.0 });
-
-                            // Pause buttons: if P2 paused, place on Monitor 2 (+480), otherwise on Monitor 1 (-480)
-                            if (pauseMenu->VBButton) {
-                                float shift = (pauseMenu->Owner_Player_Index == 1) ? 480.0f : -480.0f;
-                                pauseMenu->VBButton->SetRenderTranslation(SDK::FVector2D{ shift, 0.0 });
+                            // Expand pause background blur and black background to full 3840x1080
+                            if (pauseMenu->WidgetTree && pauseMenu->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass())) {
+                                auto pauseScaleBox = static_cast<SDK::UScaleBox*>(pauseMenu->WidgetTree->RootWidget);
+                                if (pauseScaleBox->Slots.IsValidIndex(0) && pauseScaleBox->Slots[0]->Content) {
+                                    if (pauseScaleBox->Slots[0]->Content->IsA(SDK::UCanvasPanel::StaticClass())) {
+                                        auto panel = static_cast<SDK::UCanvasPanel*>(pauseScaleBox->Slots[0]->Content);
+                                        panel->SetClipping(SDK::EWidgetClipping::Inherit);
+                                        for (int i = 0; i < panel->Slots.Num(); ++i) {
+                                            if (panel->Slots.IsValidIndex(i) && panel->Slots[i]) {
+                                                auto slot = static_cast<SDK::UCanvasPanelSlot*>(panel->Slots[i]);
+                                                if (slot->Content && (slot->Content->GetName().contains("Blur") || slot->Content->GetName().contains("Black") || slot->Content->GetName().contains("BG"))) {
+                                                    slot->SetOffsets(SDK::FMargin(-960.0f, 0.0f, -960.0f, 0.0f));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
+
+                            // Determine which player paused: P1 = -960 (Monitor 1), P2 = +960 (Monitor 2)
+                            float shift = (pauseMenu->Owner_Player_Index == 1) ? 960.0f : -960.0f;
+                            SDK::FVector2D pauseShift{ shift, 0.0 };
+
+                            if (pauseMenu->VBButton) pauseMenu->VBButton->SetRenderTranslation(pauseShift);
+                            if (pauseMenu->TXT_ClassName) pauseMenu->TXT_ClassName->SetRenderTranslation(pauseShift);
+                            if (pauseMenu->Line) pauseMenu->Line->SetRenderTranslation(pauseShift);
+                            if (pauseMenu->HorizontalBox_RSR) pauseMenu->HorizontalBox_RSR->SetRenderTranslation(pauseShift);
+                            if (pauseMenu->WBP_CMN_PlayerNumber_Big) pauseMenu->WBP_CMN_PlayerNumber_Big->SetRenderTranslation(pauseShift);
+                            if (pauseMenu->WBP_CMN_PlayerNumber_Big_1P) pauseMenu->WBP_CMN_PlayerNumber_Big_1P->SetRenderTranslation(pauseShift);
+                            if (pauseMenu->WBP_CMN_PlayerNumber_Big_P2) pauseMenu->WBP_CMN_PlayerNumber_Big_P2->SetRenderTranslation(pauseShift);
+                            if (pauseMenu->WS_Icon_Active) pauseMenu->WS_Icon_Active->SetRenderTranslation(pauseShift);
+                            if (pauseMenu->WBP_FooterMenu) pauseMenu->WBP_FooterMenu->SetRenderTranslation(pauseShift);
+
+                            // Player 1 gadget info -> Monitor 1 (-960)
+                            if (pauseMenu->Overlay_Option_Btn_03_P1) pauseMenu->Overlay_Option_Btn_03_P1->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+                            if (pauseMenu->WidgetSwitcher_P1) pauseMenu->WidgetSwitcher_P1->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+                            if (pauseMenu->WBP_GadgetCustom_Sub_GadgetPlate_P1) pauseMenu->WBP_GadgetCustom_Sub_GadgetPlate_P1->SetRenderTranslation(SDK::FVector2D{ -960.0, 0.0 });
+
+                            // Player 2 gadget info -> Monitor 2 (+960)
+                            if (pauseMenu->Overlay_Option_Btn_03_P2) pauseMenu->Overlay_Option_Btn_03_P2->SetRenderTranslation(SDK::FVector2D{ 960.0, 0.0 });
+                            if (pauseMenu->WidgetSwitcher_P2) pauseMenu->WidgetSwitcher_P2->SetRenderTranslation(SDK::FVector2D{ 960.0, 0.0 });
+                            if (pauseMenu->WBP_GadgetCustom_Sub_GadgetPlate_P2) pauseMenu->WBP_GadgetCustom_Sub_GadgetPlate_P2->SetRenderTranslation(SDK::FVector2D{ 960.0, 0.0 });
                         }
                     }
 
-                    if (bDualMonitor2P && bMirror2PMenus && bIs2PlayerRace) {
-                        if (sWidgetName.contains("ClassSelect") || sWidgetName.contains("CourseSelect") || sWidgetName.contains("RivalSelect")) {
+                    if (bDualMonitor2P && bMirror2PMenus && bIs2PlayerRace && !bIsMenuCloning) {
+                        bool bIsSharedMenu = sWidgetName.contains("ClassSelect") ||
+                                             sWidgetName.contains("CourseSelect") ||
+                                             sWidgetName.contains("RivalSelect") ||
+                                             sWidgetName.contains("RivalCutin") ||
+                                             sWidgetName.contains("RivalChoice") ||
+                                             sWidgetName.contains("RaceBefore");
+
+                        if (bIsSharedMenu) {
                             auto widget = static_cast<SDK::UUserWidget*>(WidgetObject);
-                            SPDLOG_INFO("HUD: Centering shared menu {} on Monitor 1", sWidgetName);
+                            SPDLOG_INFO("HUD: Dual-Monitor shared menu mirroring for {}", sWidgetName);
                             if (widget->WidgetTree && widget->WidgetTree->RootWidget) {
                                 widget->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
                                 widget->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ -960.0f, 0.0f });
+
+                                if (pCurrentMenuClone) {
+                                    pCurrentMenuClone->RemoveFromParent();
+                                    pCurrentMenuClone = nullptr;
+                                }
+
+                                bIsMenuCloning = true;
+                                auto clone = SDK::UWidgetBlueprintLibrary::Create(widget, widget->Class, nullptr);
+                                bIsMenuCloning = false;
+                                if (clone) {
+                                    clone->AddToViewport(0);
+                                    clone->SetVisibility(SDK::ESlateVisibility::HitTestInvisible);
+                                    if (clone->WidgetTree && clone->WidgetTree->RootWidget) {
+                                        clone->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
+                                        clone->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ 960.0f, 0.0f });
+                                    }
+                                    pCurrentMenuClone = clone;
+                                }
                             }
                         }
-                    }
-
-                    if (sWidgetName.contains("WBP_Ready_M1_C") || sWidgetName.contains("WBP_CMN_MainMenu") || sWidgetName.contains("WBP_Title")) {
-                        bIs2PlayerRace = false;
                     }
                 });
         }
