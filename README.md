@@ -82,12 +82,9 @@ Enabled = true               ; Corrects HUD scaling and 3D position markers
 
 ---
 
-## Credits
+## Credits & Acknowledgments
 
-- **Lyall** — Author of the original [CrossWorldsFix](https://codeberg.org/Lyall/CrossWorldsFix) ASI loader and pattern-scanning foundation.
-- **Hugo Fiermein** — Dual-monitor 2-player viewport isolation, dual-screen HUD layout, menu separation, and reticle aiming fix.
-- [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) by ThirteenAG
-- [safetyhook](https://github.com/cursey/safetyhook)
-- [spdlog](https://github.com/gabime/spdlog)
-- [inipp](https://github.com/mcmtroffaes/inipp)
-- [Dumper-7](https://github.com/Encryqed/Dumper-7)
+- **[Lyall](https://codeberg.org/Lyall/CrossWorldsFix)** — Authors of the original CrossWorldsFix mod, memory pattern scanning, and reverse engineering foundation.
+- **[Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)** by ThirteenAG — ASI plugin loader.
+- **[safetyhook](https://github.com/cursey/safetyhook)** by cursey — Memory hooking library.
+- **[Dumper-7](https://github.com/Encryqed/Dumper-7)** by Encryqed — Unreal Engine SDK generator.

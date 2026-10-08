@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <string>
 
@@ -7,7 +7,7 @@
 
 #define VERSION_MAJOR 0
 #define VERSION_MINOR 0
-#define VERSION_PATCH 3
+#define VERSION_PATCH 4
 
 #define STRINGIFY_HELPER(x) #x
 #define STRINGIFY(x) STRINGIFY_HELPER(x)
@@ -16,11 +16,11 @@
 inline const std::string sFixVersion = VERSION_STRING;
 inline const std::string sFixName = FIX_NAME;
 
-#define COMPANY_NAME      "Lyall"
+#define COMPANY_NAME      "Lyall, Hugo Fiermein"
 #define PRODUCT_NAME      FIX_NAME
 #define PRODUCT_VERSION   VERSION_STRING
 #define FILE_VERSION      VERSION_STRING
-#define LEGAL_COPYRIGHT   "© 2025 Lyall. Licensed under the MIT License."
+#define LEGAL_COPYRIGHT   "© 2025 Lyall. © 2026 Hugo Fiermein. Licensed under the MIT License."
 #define LEGAL_TRADEMARKS  ""
 #define COMMENTS          ""
 #define FILE_DESCRIPTION_ASI     FIX_NAME " ASI Plugin"

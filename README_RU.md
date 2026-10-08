@@ -81,12 +81,9 @@ Enabled = true               ; Исправляет масштаб интерф�
 
 ---
 
-## Благодарности и авторы
+## Благодарности и используемые компоненты
 
-- **Lyall** — Разработчик оригинальной основы ASI-плагина [CrossWorldsFix](https://codeberg.org/Lyall/CrossWorldsFix) и сканирования сигнатур памяти.
-- **Hugo Fiermein** — Реализация вывода на 2 монитора, изоляция вьюпортов и HUD игроков, адаптация меню под 2 экрана и исправление прицела.
-- [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) от ThirteenAG
-- [safetyhook](https://github.com/cursey/safetyhook)
-- [spdlog](https://github.com/gabime/spdlog)
-- [inipp](https://github.com/mcmtroffaes/inipp)
-- [Dumper-7](https://github.com/Encryqed/Dumper-7)
+- **[Lyall](https://codeberg.org/Lyall/CrossWorldsFix)** — Авторы оригинального мода CrossWorldsFix, реверс-инжиниринг и поиск сигнатур в памяти игры.
+- **[Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)** от ThirteenAG — Загрузчик ASI-плагинов (`winmm.dll`).
+- **[safetyhook](https://github.com/cursey/safetyhook)** — Библиотека для создания хуков в памяти.
+- **[Dumper-7](https://github.com/Encryqed/Dumper-7)** — Инструмент генерации SDK Unreal Engine.
