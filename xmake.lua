@@ -6,7 +6,8 @@ set_languages("cxxlatest", "clatest")
 set_optimize("fastest")
 
 if is_mode("release") then
-    set_symbols("hidden")
+    -- keep a .pdb next to the .asi so crash offsets from the Windows event log can be resolved
+    set_symbols("debug")
     set_strip("all")
 else
     set_symbols("debug")
