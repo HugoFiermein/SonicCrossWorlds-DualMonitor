@@ -1235,77 +1235,41 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
     // Rendered untouched; the Present hook moves each half onto its player's monitor (FrameMode::Split).
     const bool bIsSplitScreen = name.contains("WBP_MachineCharaSelect_M2") ||
                                 name.contains("GadgetCutom_M2") || name.contains("GadgetCustom_M2") ||
-                                name.contains("WBP_Ready_M2_C") ||
                                 name.contains("WBP_Result_GP_Player0204");
     if (bIsSplitScreen) {
         bIs2PlayerRace = true;
         if (bDualMenus && g_bPixelDuplication) {
             SPDLOG_INFO("HUD: Dual-Monitor per-player screen {} -> split across monitors", name);
-            SDK::UWidget* splitSource = userWidget;
-            if (name.contains("WBP_Ready_M2_C")) {
-                // The Ready widget can stay "visible" with its cards faded out; follow the cards container instead
-                WidgetIndex w(userWidget);
-                if (auto sz = w["SafeZone_Ready_M2"]; sz && sz->IsA(SDK::UPanelWidget::StaticClass())) {
-                    auto p = static_cast<SDK::UPanelWidget*>(sz);
-                    if (p->Slots.IsValidIndex(0) && p->Slots[0] && p->Slots[0]->Content)
-                        splitSource = p->Slots[0]->Content;
-                }
-            }
-            RegisterSharedMenu(splitSource, userWidget, MenuKind::Split);
+            RegisterSharedMenu(userWidget, userWidget, MenuKind::Split);
 
-            // "GO!" banner of the Ready screen covers the whole window: show it whole on both monitors
-            if (name.contains("WBP_Ready_M2_C")) {
+            // The character grid sits in the middle of the window, over both halves: while it is shown,
+            // show the whole window on both monitors instead of cutting the grid in two
+            if (name.contains("WBP_MachineCharaSelect_M2")) {
                 WidgetIndex w(userWidget);
-                if (auto decide = w.Get<SDK::UUserWidget>("WBP_Ready_Sub_Decide"); decide && decide->IsA(SDK::UUserWidget::StaticClass())) {
-                    WidgetIndex dw(decide);
-                    if (auto txt = dw["TXT_GO"])
-                        RegisterSharedMenu(txt, userWidget, MenuKind::DupHigh);
-                }
+                RegisterSharedMenu(w["WBP_CharaSelect_Sub_Window"], userWidget, MenuKind::DupHigh);
             }
         }
     }
 
-
-    // ---------- Pause menu (2P only: in 1P it must stay centred) ----------
-    if (name.contains("WBP_PauseMenu_C") && bDualMenus && bIs2PlayerRace) {
-        SPDLOG_INFO("HUD: Applying Dual-Monitor layout to WBP_PauseMenu_C");
-        WidgetIndex w(userWidget);
-
-        if (userWidget->WidgetTree && userWidget->WidgetTree->RootWidget) {
-            auto root = userWidget->WidgetTree->RootWidget;
-            root->SetClipping(SDK::EWidgetClipping::Inherit);
-
-            // Expand blur / black background to both monitors
-            if (root->IsA(SDK::UScaleBox::StaticClass())) {
-                auto pauseScaleBox = static_cast<SDK::UScaleBox*>(root);
-                if (pauseScaleBox->Slots.IsValidIndex(0) && pauseScaleBox->Slots[0] && pauseScaleBox->Slots[0]->Content
-                    && pauseScaleBox->Slots[0]->Content->IsA(SDK::UCanvasPanel::StaticClass())) {
-                    auto panel = static_cast<SDK::UCanvasPanel*>(pauseScaleBox->Slots[0]->Content);
-                    panel->SetClipping(SDK::EWidgetClipping::Inherit);
-                    for (int i = 0; i < panel->Slots.Num(); ++i) {
-                        auto slot = static_cast<SDK::UCanvasPanelSlot*>(panel->Slots[i]);
-                        if (!slot || !slot->Content) continue;
-                        std::string childName = slot->Content->GetName();
-                        if (childName.contains("Blur") || childName.contains("Black") || childName.contains("BG"))
-                            slot->SetOffsets(SDK::FMargin(-960.0f, 0.0f, -960.0f, 0.0f));
-                    }
-                }
+    // ---------- Ready screen: whole window on both monitors ("READY?" / "GO!" run across the middle) ----------
+    // It sits on top of the course select (a shared menu), which already selects CenterDup.
+    if (name.contains("WBP_Ready_M2_C")) {
+        bIs2PlayerRace = true;
+        if (bDualMenus && g_bPixelDuplication) {
+            WidgetIndex w(userWidget);
+            RegisterSharedMenu(userWidget, userWidget, MenuKind::DupLow);
+            if (auto decide = w.Get<SDK::UUserWidget>("WBP_Ready_Sub_Decide"); decide && decide->IsA(SDK::UUserWidget::StaticClass())) {
+                WidgetIndex dw(decide);
+                RegisterSharedMenu(dw["TXT_GO"], userWidget, MenuKind::DupHigh);
             }
         }
+    }
 
-        // Owner_Player_Index (0-based) is a plain BP field, its offset may be stale after a game update:
-        // only trust sane values. 0 = P1 -> Monitor 1, 1 = P2 -> Monitor 2.
-        int ownerIdx = static_cast<SDK::UWBP_PauseMenu_C*>(obj)->Owner_Player_Index;
-        const float shift = (ownerIdx == 1) ? 960.0f : -960.0f;
-        for (auto n : { "VBButton", "TXT_ClassName", "Line", "HorizontalBox_RSR",
-                        "WBP_CMN_PlayerNumber_Big", "WBP_CMN_PlayerNumber_Big_1P", "WBP_CMN_PlayerNumber_Big_P2",
-                        "WS_Icon_Active", "WBP_FooterMenu" })
-            SetTranslation(w[n], shift);
-
-        for (auto n : { "Overlay_Option_Btn_03_P1", "WidgetSwitcher_P1", "WBP_GadgetCustom_Sub_GadgetPlate_P1" })
-            SetTranslation(w[n], -960.0f);
-        for (auto n : { "Overlay_Option_Btn_03_P2", "WidgetSwitcher_P2", "WBP_GadgetCustom_Sub_GadgetPlate_P2" })
-            SetTranslation(w[n], 960.0f);
+    // ---------- Pause menu (2P): vanilla centred 16:9 window, shown whole on both monitors ----------
+    // (the old per-element moves double-shifted the gadget plates and pushed the buttons onto the bezel)
+    if (name.contains("WBP_PauseMenu_C") && bDualMenus && bIs2PlayerRace && g_bPixelDuplication) {
+        SPDLOG_INFO("HUD: Dual-Monitor pause menu -> centre window mirrored to both monitors");
+        RegisterSharedMenu(userWidget, userWidget, MenuKind::DupHigh);
     }
 
     // ---------- Shared full-screen menus: centre 16:9 window shown on both monitors ----------
