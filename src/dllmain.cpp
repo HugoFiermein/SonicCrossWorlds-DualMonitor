@@ -15,6 +15,9 @@
 #include <cmath>
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include "SDK/Basic.hpp"
 #include "SDK/Engine_classes.hpp"
@@ -205,16 +208,76 @@ void RegisterMenuClone(SDK::UUserWidget* clone, SDK::UUserWidget* owner, SDK::UW
     MirrorCloneVisibility(g_MenuClones.back());
 }
 
+// ---------- Shared 2P menus duplicated by pixels ----------
+// Shared menus (course/class/rival select, intros) are moved to Monitor 1 and, while one of them is visible,
+// the left half of every presented frame is copied into the right half (see D3D12 section below).
+// Unlike a cloned widget, this shows exactly what the game filled in (names, rivals, animations).
+struct SharedMenu
+{
+    SDK::UUserWidget* W = nullptr;
+    int32_t Idx = -1;
+    bool bSeenInViewport = false;
+};
+std::vector<SharedMenu> g_SharedMenus;
+std::atomic<bool> g_bDuplicateLeftHalf{ false };   // read on the RHI thread in Present
+bool g_bPixelDuplication = false;                   // D3D12 hooks installed
+
+void UpdateSharedMenus(bool bCheckViewport)
+{
+    CloneOpGuard guard;
+    std::erase_if(g_SharedMenus, [bCheckViewport](SharedMenu& m) {
+        if (!IsObjectAlive(m.W, m.Idx))
+            return true;
+        if (bCheckViewport) {
+            if (m.W->IsInViewport())
+                m.bSeenInViewport = true;
+            else if (m.bSeenInViewport)
+                return true;
+        }
+        return false;
+    });
+
+    bool bAnyVisible = false;
+    if (bIs2PlayerRace && IsDualMonitorLayout()) {
+        for (const auto& m : g_SharedMenus) {
+            auto v = m.W->Visibility;
+            if (v != SDK::ESlateVisibility::Collapsed && v != SDK::ESlateVisibility::Hidden) {
+                bAnyVisible = true;
+                break;
+            }
+        }
+    }
+    g_bDuplicateLeftHalf.store(bAnyVisible, std::memory_order_relaxed);
+}
+
+void RegisterSharedMenu(SDK::UUserWidget* w)
+{
+    for (const auto& m : g_SharedMenus)
+        if (m.W == w) return;
+    g_SharedMenus.push_back({ w, w->Index, false });
+    UpdateSharedMenus(false);
+}
+
+void ClearSharedMenus()
+{
+    g_SharedMenus.clear();
+    g_bDuplicateLeftHalf.store(false, std::memory_order_relaxed);
+}
+
 // SEH wrapper (no C++ objects with destructors allowed here). CloneOpGuard's destructor is skipped
 // when an SEH exception unwinds, so the depth counter is reset by hand.
 static void SafeSyncMenuClones(bool bCheckViewport)
 {
     __try {
         SyncMenuClones(bCheckViewport);
+        UpdateSharedMenus(bCheckViewport);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         g_CloneOpDepth = 0;
-        g_MenuClones.clear();   // pointers are suspect now, forget them rather than touch them again
+        // pointers are suspect now, forget them rather than touch them again
+        g_MenuClones.clear();
+        g_SharedMenus.clear();
+        g_bDuplicateLeftHalf.store(false, std::memory_order_relaxed);
     }
 }
 
@@ -225,7 +288,7 @@ void ProcessEvent_Hook(SDK::UObject* obj, SDK::UFunction* fn, void* parms)
     // unsafe_call: call() locks a mutex around the whole original, which would serialise every ProcessEvent in the game
     ProcessEventHook.unsafe_call<void>(obj, fn, parms);
 
-    if (g_CloneOpDepth > 0 || g_bIsMenuCloning || GetCurrentThreadId() != g_GameThreadId || g_MenuClones.empty())
+    if (g_CloneOpDepth > 0 || g_bIsMenuCloning || GetCurrentThreadId() != g_GameThreadId || (g_MenuClones.empty() && g_SharedMenus.empty()))
         return;
 
     static ULONGLONG lastViewportCheck = 0;
@@ -498,6 +561,256 @@ void AspectRatioFOV()
     }
 }
 
+// ---------- D3D12: copy left half of the frame to the right half ----------
+// Runs on the RHI thread inside IDXGISwapChain::Present. No logging here (the spdlog sink is single-threaded):
+// errors are stored and reported from the game thread.
+std::atomic<ID3D12CommandQueue*> g_DirectQueue{ nullptr };
+std::atomic<HRESULT> g_DupError{ S_OK };
+SafetyHookInline PresentHook{};
+SafetyHookInline Present1Hook{};
+SafetyHookInline ExecuteCommandListsHook{};
+
+struct DupResources
+{
+    ID3D12Device* Device = nullptr;
+    ID3D12CommandAllocator* Alloc = nullptr;
+    ID3D12GraphicsCommandList* List = nullptr;
+    ID3D12Fence* Fence = nullptr;
+    HANDLE FenceEvent = nullptr;
+    UINT64 FenceValue = 0;
+    ID3D12Resource* Temp = nullptr;
+    UINT64 TempWidth = 0;
+    UINT TempHeight = 0;
+    DXGI_FORMAT TempFormat = DXGI_FORMAT_UNKNOWN;
+    bool bFailed = false;
+} g_Dup;
+
+static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = after;
+    return b;
+}
+
+static bool DupFail(HRESULT hr)
+{
+    g_Dup.bFailed = true;
+    g_DupError.store(hr == S_OK ? E_FAIL : hr);
+    return false;
+}
+
+// Plain C-style function (no destructors) so it can sit inside __try.
+static bool DuplicateLeftHalf(IDXGISwapChain* swapChain)
+{
+    ID3D12CommandQueue* queue = g_DirectQueue.load();
+    if (!queue || g_Dup.bFailed)
+        return false;
+
+    IDXGISwapChain3* sc3 = nullptr;
+    if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&sc3))))
+        return false;
+    UINT bbIndex = sc3->GetCurrentBackBufferIndex();
+    ID3D12Resource* bb = nullptr;
+    HRESULT hr = sc3->GetBuffer(bbIndex, IID_PPV_ARGS(&bb));
+    sc3->Release();
+    if (FAILED(hr) || !bb)
+        return false;
+
+    D3D12_RESOURCE_DESC bbDesc = bb->GetDesc();
+    const UINT64 half = bbDesc.Width / 2;
+    const UINT height = bbDesc.Height;
+    bool ok = false;
+
+    do {
+        // One-time setup on the swap chain's device
+        if (!g_Dup.Device) {
+            if (FAILED(hr = bb->GetDevice(IID_PPV_ARGS(&g_Dup.Device)))) { DupFail(hr); break; }
+            if (FAILED(hr = g_Dup.Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_Dup.Alloc)))) { DupFail(hr); break; }
+            if (FAILED(hr = g_Dup.Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_Dup.Alloc, nullptr, IID_PPV_ARGS(&g_Dup.List)))) { DupFail(hr); break; }
+            g_Dup.List->Close();
+            if (FAILED(hr = g_Dup.Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_Dup.Fence)))) { DupFail(hr); break; }
+            g_Dup.FenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        }
+
+        // The queue we copy on must belong to the same device as the swap chain
+        ID3D12Device* queueDevice = nullptr;
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&queueDevice))))
+            break;
+        bool sameDevice = queueDevice == g_Dup.Device;
+        queueDevice->Release();
+        if (!sameDevice)
+            break;
+
+        // Intermediate texture (D3D12 can't copy a texture region onto the same subresource)
+        if (!g_Dup.Temp || g_Dup.TempWidth != half || g_Dup.TempHeight != height || g_Dup.TempFormat != bbDesc.Format) {
+            if (g_Dup.Temp) {
+                // previous copy must be done before the old texture is released
+                if (g_Dup.Fence->GetCompletedValue() < g_Dup.FenceValue) {
+                    g_Dup.Fence->SetEventOnCompletion(g_Dup.FenceValue, g_Dup.FenceEvent);
+                    WaitForSingleObject(g_Dup.FenceEvent, 1000);
+                }
+                g_Dup.Temp->Release();
+                g_Dup.Temp = nullptr;
+            }
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td = bbDesc;
+            td.Width = half;
+            td.Alignment = 0;
+            td.MipLevels = 1;
+            td.DepthOrArraySize = 1;
+            td.SampleDesc = { 1, 0 };
+            td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            td.Flags = D3D12_RESOURCE_FLAG_NONE;
+            if (FAILED(hr = g_Dup.Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_Dup.Temp)))) { DupFail(hr); break; }
+            g_Dup.TempWidth = half;
+            g_Dup.TempHeight = height;
+            g_Dup.TempFormat = bbDesc.Format;
+        }
+
+        // Previous frame's copy must be finished before the allocator is reused
+        if (g_Dup.Fence->GetCompletedValue() < g_Dup.FenceValue) {
+            g_Dup.Fence->SetEventOnCompletion(g_Dup.FenceValue, g_Dup.FenceEvent);
+            WaitForSingleObject(g_Dup.FenceEvent, 1000);
+        }
+        if (FAILED(hr = g_Dup.Alloc->Reset())) { DupFail(hr); break; }
+        if (FAILED(hr = g_Dup.List->Reset(g_Dup.Alloc, nullptr))) { DupFail(hr); break; }
+
+        auto list = g_Dup.List;
+        D3D12_BOX box{ 0, 0, 0, static_cast<UINT>(half), height, 1 };
+
+        // backbuffer left half -> temp
+        D3D12_RESOURCE_BARRIER b1 = Transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &b1);
+        D3D12_TEXTURE_COPY_LOCATION dstTemp{}; dstTemp.pResource = g_Dup.Temp; dstTemp.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION srcBB{};   srcBB.pResource = bb;          srcBB.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dstTemp, 0, 0, 0, &srcBB, &box);
+
+        // temp -> backbuffer right half
+        D3D12_RESOURCE_BARRIER b2[2] = {
+            Transition(g_Dup.Temp, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST) };
+        list->ResourceBarrier(2, b2);
+        D3D12_TEXTURE_COPY_LOCATION dstBB{};   dstBB.pResource = bb;          dstBB.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION srcTemp{}; srcTemp.pResource = g_Dup.Temp; srcTemp.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dstBB, static_cast<UINT>(half), 0, 0, &srcTemp, &box);
+
+        // back to present / ready for next frame
+        D3D12_RESOURCE_BARRIER b3[2] = {
+            Transition(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+            Transition(g_Dup.Temp, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST) };
+        list->ResourceBarrier(2, b3);
+
+        if (FAILED(hr = list->Close())) { DupFail(hr); break; }
+        ID3D12CommandList* lists[] = { list };
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(g_Dup.Fence, ++g_Dup.FenceValue);
+        ok = true;
+    } while (false);
+
+    bb->Release();
+    return ok;
+}
+
+static void SafeDuplicateLeftHalf(IDXGISwapChain* swapChain)
+{
+    if (!g_bDuplicateLeftHalf.load(std::memory_order_relaxed))
+        return;
+    __try {
+        DuplicateLeftHalf(swapChain);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_Dup.bFailed = true;
+        g_DupError.store(static_cast<HRESULT>(GetExceptionCode()));
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE Present_Hook(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
+{
+    if (!(flags & DXGI_PRESENT_TEST))
+        SafeDuplicateLeftHalf(swapChain);
+    return PresentHook.unsafe_call<HRESULT>(swapChain, syncInterval, flags);
+}
+
+static HRESULT STDMETHODCALLTYPE Present1_Hook(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* params)
+{
+    if (!(flags & DXGI_PRESENT_TEST))
+        SafeDuplicateLeftHalf(swapChain);
+    return Present1Hook.unsafe_call<HRESULT>(swapChain, syncInterval, flags, params);
+}
+
+// Only used to learn the game's direct queue
+static void STDMETHODCALLTYPE ExecuteCommandLists_Hook(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
+{
+    if (!g_DirectQueue.load(std::memory_order_relaxed) && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        ID3D12CommandQueue* expected = nullptr;
+        if (g_DirectQueue.compare_exchange_strong(expected, queue))
+            queue->AddRef();
+    }
+    ExecuteCommandListsHook.unsafe_call<void>(queue, count, lists);
+}
+
+// Gets Present / Present1 / ExecuteCommandLists addresses from a throwaway device + swap chain
+static bool InstallD3D12Hooks()
+{
+    bool ok = false;
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{ sizeof(WNDCLASSEXW) };
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = inst;
+    wc.lpszClassName = L"CrossWorldsFixDummy";
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, inst, nullptr);
+
+    IDXGIFactory4* factory = nullptr;
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    IDXGISwapChain1* sc = nullptr;
+
+    do {
+        if (!hwnd) { SPDLOG_ERROR("D3D12: dummy window failed"); break; }
+        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) { SPDLOG_ERROR("D3D12: CreateDXGIFactory1 failed 0x{:x}", (unsigned)hr); break; }
+        hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+        if (FAILED(hr)) { SPDLOG_ERROR("D3D12: D3D12CreateDevice failed 0x{:x}", (unsigned)hr); break; }
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+        if (FAILED(hr)) { SPDLOG_ERROR("D3D12: CreateCommandQueue failed 0x{:x}", (unsigned)hr); break; }
+        DXGI_SWAP_CHAIN_DESC1 sd{};
+        sd.Width = 64;
+        sd.Height = 64;
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = 2;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        hr = factory->CreateSwapChainForHwnd(queue, hwnd, &sd, nullptr, nullptr, &sc);
+        if (FAILED(hr)) { SPDLOG_ERROR("D3D12: CreateSwapChainForHwnd failed 0x{:x}", (unsigned)hr); break; }
+
+        void** scVtbl = *reinterpret_cast<void***>(sc);
+        void** qVtbl = *reinterpret_cast<void***>(queue);
+
+        PresentHook = safetyhook::create_inline(scVtbl[8], reinterpret_cast<void*>(&Present_Hook));
+        Present1Hook = safetyhook::create_inline(scVtbl[22], reinterpret_cast<void*>(&Present1_Hook));
+        ExecuteCommandListsHook = safetyhook::create_inline(qVtbl[10], reinterpret_cast<void*>(&ExecuteCommandLists_Hook));
+        ok = PresentHook && ExecuteCommandListsHook;
+        if (!ok) SPDLOG_ERROR("D3D12: failed to hook Present/ExecuteCommandLists");
+    } while (false);
+
+    if (sc) sc->Release();
+    if (queue) queue->Release();
+    if (device) device->Release();
+    if (factory) factory->Release();
+    if (hwnd) DestroyWindow(hwnd);
+    UnregisterClassW(wc.lpszClassName, inst);
+    return ok;
+}
+
 // ---------- Widget lookup by name ----------
 // Blueprint widget classes here all derive from game classes (UUnionRaceUI, UReadyWindow, UUnionUISceneBase...).
 // When the game updates, those parents change size and every member offset in the dumped SDK shifts:
@@ -680,10 +993,19 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
     if (name.contains("WBP_Ready_M1_C") || name.contains("WBP_CMN_MainMenu") || name.contains("WBP_TitleMenu") || name.contains("WBP_TopMenu")) {
         bIs2PlayerRace = false;
         DestroyAllMenuClones();
+        ClearSharedMenus();
     }
-    else if (!g_MenuClones.empty()) {
-        // Also covers Loading/Transition/BlackBoard and the 2P race HUD: drop clones whose original is gone.
+    else if (!g_MenuClones.empty() || !g_SharedMenus.empty()) {
+        // Also covers Loading/Transition/BlackBoard and the 2P race HUD: drop entries whose original is gone.
         SyncMenuClones(true);
+        UpdateSharedMenus(true);
+    }
+
+    // Report D3D12 duplication errors from the game thread (the RHI thread can't log safely)
+    static bool bDupErrorLogged = false;
+    if (!bDupErrorLogged && g_DupError.load() != S_OK) {
+        bDupErrorLogged = true;
+        SPDLOG_ERROR("D3D12: frame duplication disabled after error 0x{:x}", static_cast<unsigned>(g_DupError.load()));
     }
 
     // ---------- 2P race HUD ----------
@@ -861,11 +1183,19 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
                                    name.contains("RaceBefore");
 
         if (bIsSharedMenu && userWidget->WidgetTree && userWidget->WidgetTree->RootWidget && userWidget->Class) {
-            SPDLOG_INFO("HUD: Dual-Monitor shared menu duplicating for {}", name);
             userWidget->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
             // -1920 / +1920 design units = left / right monitor at this widget's DPI scale
             userWidget->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ -1920.0f, 0.0f });
 
+            // Preferred: Monitor 1 picture is copied to Monitor 2 by the Present hook (real data, real animations)
+            if (g_bPixelDuplication) {
+                SPDLOG_INFO("HUD: Dual-Monitor shared menu {} -> Monitor 1, mirrored to Monitor 2 by frame copy", name);
+                RegisterSharedMenu(userWidget);
+                return;
+            }
+
+            // Fallback (D3D12 hooks unavailable): passive clone on Monitor 2. Clones don't get the game's data.
+            SPDLOG_INFO("HUD: Dual-Monitor shared menu duplicating for {}", name);
             const std::string className = userWidget->Class->GetName();
             if (auto clone = CreateMonitor2Clone(userWidget, userWidget->Class, 0, 1920.0f)) {
                 RegisterMenuClone(clone, userWidget, userWidget, className, false);
@@ -1037,6 +1367,9 @@ void HUD()
                 else {
                     SPDLOG_ERROR("HUD: Dual-Monitor clone sync: ProcessEvent offset unknown, clones will only be cleaned on menu changes.");
                 }
+
+                g_bPixelDuplication = InstallD3D12Hooks();
+                SPDLOG_INFO("HUD: Dual-Monitor shared menus: {}", g_bPixelDuplication ? "frame copy (D3D12 Present hook)" : "widget clones (fallback)");
             }
         }
         else {

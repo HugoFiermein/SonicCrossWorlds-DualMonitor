@@ -105,7 +105,7 @@ target(name)
     add_files("src/*.cpp", "src/resources/version.rc", "external/safetyhook/src/**.cpp", "src/SDK/Basic.cpp", "src/SDK/CoreUObject_functions.cpp", "src/SDK/Engine_functions.cpp", "src/SDK/UMG_functions.cpp")
 
     add_deps("zydis")
-    add_syslinks("user32")
+    add_syslinks("user32", "d3d12", "dxgi")
 
     if is_plat("windows") then
         set_toolchains("msvc")
