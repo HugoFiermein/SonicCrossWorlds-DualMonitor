@@ -365,6 +365,47 @@ void ClearSharedMenus()
 }
 
 
+// ---------- Per-player minimap ----------
+// WBP_Race_HUD_CourseMap is just two images (track texture + live render target the game draws racers into).
+// A second instance on monitor 2 shows the same data when its images use the original's brushes.
+struct MinimapMirror
+{
+    SDK::UUserWidget* Orig = nullptr;  int32_t OrigIdx = -1;
+    SDK::UUserWidget* Clone = nullptr; int32_t CloneIdx = -1;
+    SDK::UImage* OrigImg[2]{};  int32_t OrigImgIdx[2]{ -1, -1 };
+    SDK::UImage* CloneImg[2]{}; int32_t CloneImgIdx[2]{ -1, -1 };
+};
+MinimapMirror g_Minimap;
+
+static void MirrorVisibility(SDK::UWidget* src, SDK::UWidget* dst)
+{
+    if (dst->Visibility != src->Visibility)
+        dst->SetVisibility(src->Visibility);
+    if (std::fabs(dst->RenderOpacity - src->RenderOpacity) > 0.001f)
+        dst->SetRenderOpacity(src->RenderOpacity);
+}
+
+void SyncMinimap()
+{
+    if (!g_Minimap.Clone)
+        return;
+    CloneOpGuard guard;
+    if (!IsObjectAlive(g_Minimap.Orig, g_Minimap.OrigIdx) || !IsObjectAlive(g_Minimap.Clone, g_Minimap.CloneIdx)) {
+        g_Minimap = {};
+        return;
+    }
+    MirrorVisibility(g_Minimap.Orig, g_Minimap.Clone);
+    for (int i = 0; i < 2; ++i) {
+        auto src = g_Minimap.OrigImg[i];
+        auto dst = g_Minimap.CloneImg[i];
+        if (!IsObjectAlive(src, g_Minimap.OrigImgIdx[i]) || !IsObjectAlive(dst, g_Minimap.CloneImgIdx[i]))
+            continue;
+        if (dst->Brush.ResourceObject != src->Brush.ResourceObject)
+            dst->SetBrush(src->Brush);
+        MirrorVisibility(src, dst);
+    }
+}
+
 // SEH wrapper (no C++ objects with destructors allowed here). CloneOpGuard's destructor is skipped
 // when an SEH exception unwinds, so the depth counter is reset by hand.
 static void SafeSyncMenuClones(bool bCheckViewport)
@@ -372,12 +413,14 @@ static void SafeSyncMenuClones(bool bCheckViewport)
     __try {
         SyncMenuClones(bCheckViewport);
         UpdateSharedMenus(bCheckViewport);
+        SyncMinimap();
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         g_CloneOpDepth = 0;
         // pointers are suspect now, forget them rather than touch them again
         g_MenuClones.clear();
         g_SharedMenus.clear();
+        g_Minimap = {};
         g_FrameMode.store(static_cast<int>(FrameMode::None), std::memory_order_relaxed);
     }
 }
@@ -389,7 +432,7 @@ void ProcessEvent_Hook(SDK::UObject* obj, SDK::UFunction* fn, void* parms)
     // unsafe_call: call() locks a mutex around the whole original, which would serialise every ProcessEvent in the game
     ProcessEventHook.unsafe_call<void>(obj, fn, parms);
 
-    if (g_CloneOpDepth > 0 || g_bIsMenuCloning || GetCurrentThreadId() != g_GameThreadId || (g_MenuClones.empty() && g_SharedMenus.empty() && g_PendingDumps.empty()))
+    if (g_CloneOpDepth > 0 || g_bIsMenuCloning || GetCurrentThreadId() != g_GameThreadId || (g_MenuClones.empty() && g_SharedMenus.empty() && g_PendingDumps.empty() && !g_Minimap.Clone))
         return;
 
     static ULONGLONG lastViewportCheck = 0;
@@ -984,6 +1027,37 @@ static SDK::USizeBox* GetRootScaleBoxSizeBox(SDK::UUserWidget* uw)
     return static_cast<SDK::USizeBox*>(scaleBox->Slots[0]->Content);
 }
 
+static void CreateMinimapMirror(SDK::UUserWidget* hud, SDK::UWidget* panel, SDK::UUserWidget* map)
+{
+    g_Minimap = {};
+    if (!map || !map->IsA(SDK::UUserWidget::StaticClass()) || !map->Class || !panel || !panel->IsA(SDK::UCanvasPanel::StaticClass()))
+        return;
+
+    g_bIsMenuCloning = true;
+    auto clone = SDK::UWidgetBlueprintLibrary::Create(hud, map->Class, nullptr);
+    g_bIsMenuCloning = false;
+    if (!clone)
+        return;
+    if (!static_cast<SDK::UCanvasPanel*>(panel)->AddChildToCanvas(clone))
+        return;
+    SetSlotLayout(clone, 0.5f, 0.5f, 0.5f, 0.5f, SDK::FMargin{ 60.0f, 0.0f, 1024.0f, 1024.0f }, 0.0f, 0.5f);
+
+    WidgetIndex wo(map), wc(clone);
+    const char* imgs[2] = { "DMY_CourseMapTexture", "DMY_CourseMapTextureRT" };
+    g_Minimap.Orig = map;    g_Minimap.OrigIdx = map->Index;
+    g_Minimap.Clone = clone; g_Minimap.CloneIdx = clone->Index;
+    for (int i = 0; i < 2; ++i) {
+        auto o = wo[imgs[i]], c = wc[imgs[i]];
+        if (o && c && o->IsA(SDK::UImage::StaticClass()) && c->IsA(SDK::UImage::StaticClass())) {
+            g_Minimap.OrigImg[i] = static_cast<SDK::UImage*>(o);  g_Minimap.OrigImgIdx[i] = o->Index;
+            g_Minimap.CloneImg[i] = static_cast<SDK::UImage*>(c); g_Minimap.CloneImgIdx[i] = c->Index;
+        }
+    }
+    SPDLOG_INFO("HUD: Dual-Monitor minimap mirrored to monitor 2 ({} / {} images linked)",
+        g_Minimap.CloneImg[0] ? "texture" : "-", g_Minimap.CloneImg[1] ? "render target" : "-");
+    SyncMinimap();
+}
+
 void OnWidgetAddToViewport(SDK::UObject* obj)
 {
     if (!obj->Class || !obj->Class->Class)
@@ -1136,8 +1210,10 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
                 for (auto n : { "CanvasPanel_P1_HUD", "CanvasPanel_P2_HUD", "CanvasPanel_P1_StartInfo", "CanvasPanel_P2_StartInfo" })
                     SetSlotLayout(w[n], 0.0f, 0.0f, 1.0f, 1.0f, SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f }, 0.0f, 0.0f);
 
-                // Shared minimap can't be on both monitors: put it on monitor 1, right next to the bezel
-                SetSlotLayout(w["WBP_Race_HUD_CourseMap"], 0.5f, 0.5f, 0.5f, 0.5f, SDK::FMargin{ -60.0f, 0.0f, 1024.0f, 1024.0f }, 1.0f, 0.5f);
+                // Minimap per player: original on monitor 1 next to the bezel, a mirrored copy on monitor 2
+                auto map = w.Get<SDK::UUserWidget>("WBP_Race_HUD_CourseMap");
+                SetSlotLayout(map, 0.5f, 0.5f, 0.5f, 0.5f, SDK::FMargin{ -60.0f, 0.0f, 1024.0f, 1024.0f }, 1.0f, 0.5f);
+                CreateMinimapMirror(userWidget, w["CanvasPanel_141"], map);
 
                 // Physical monitor bezels already separate the screens
                 if (bDualLayout && bHideCenterLine)
