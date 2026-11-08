@@ -57,6 +57,8 @@ set_target_properties(CrossWorldsFix PROPERTIES
 
 target_link_libraries(CrossWorldsFix PRIVATE
     user32
+    d3d12
+    dxgi
     "${CMAKE_CURRENT_SOURCE_DIR}/.build_zydis/build/Release/Zydis.lib"
     "${CMAKE_CURRENT_SOURCE_DIR}/.build_zydis/build/zycore/Release/Zycore.lib"
 )

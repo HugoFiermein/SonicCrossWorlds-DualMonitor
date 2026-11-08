@@ -13,6 +13,12 @@
 #include <inipp/inipp.h>
 #include <safetyhook.hpp>
 #include <cmath>
+#include <unordered_map>
+#include <unordered_set>
+#include <atomic>
+#include <format>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include "SDK/Basic.hpp"
 #include "SDK/Engine_classes.hpp"
@@ -203,6 +209,222 @@ void RegisterMenuClone(SDK::UUserWidget* clone, SDK::UUserWidget* owner, SDK::UW
     MirrorCloneVisibility(g_MenuClones.back());
 }
 
+// ---------- 2P menus on two monitors: frame-level layout ----------
+// Every 2P menu of the game is a centred 16:9 window. Instead of moving widgets around, the Present hook
+// rearranges the finished frame (see D3D12 section):
+//   CenterDup - the centre 16:9 region is copied to both monitors (shared menus: course/class/rival select,
+//               hints, race intros, "GO!" banner). Shows exactly what the game drew, data and animations included.
+//   Split     - the left half of the centre window (P1 side) goes to the middle of monitor 1, the right half
+//               (P2 side) to the middle of monitor 2 (per-player screens: chara/machine select, Ready, results).
+enum class FrameMode : int { None = 0, CenterDup = 1, Split = 2 };
+enum class MenuKind : int { DupLow, Split, DupHigh };   // priority: DupHigh > Split > DupLow
+
+struct TrackedMenu
+{
+    SDK::UWidget* W = nullptr;       int32_t Idx = -1;       // visibility source
+    SDK::UUserWidget* Owner = nullptr; int32_t OwnerIdx = -1; // lifetime (viewport) source
+    MenuKind Kind = MenuKind::DupLow;
+    bool bSeenInViewport = false;
+};
+std::vector<TrackedMenu> g_SharedMenus;
+std::atomic<int> g_FrameMode{ static_cast<int>(FrameMode::None) };   // read on the RHI thread in Present
+bool g_bPixelDuplication = false;                                    // D3D12 hooks installed
+
+// Visible on screen = itself and every parent up to the owning UserWidget is visible and not transparent
+bool IsEffectivelyVisible(SDK::UWidget* w, SDK::UUserWidget* owner)
+{
+    int guard = 0;
+    for (SDK::UWidget* c = w; c && guard < 64; ++guard) {
+        auto v = c->Visibility;
+        if (v == SDK::ESlateVisibility::Collapsed || v == SDK::ESlateVisibility::Hidden || c->RenderOpacity < 0.01f)
+            return false;
+        if (!c->Slot) break;
+        c = c->Slot->Parent;
+    }
+    auto ov = owner->Visibility;
+    return ov != SDK::ESlateVisibility::Collapsed && ov != SDK::ESlateVisibility::Hidden && owner->RenderOpacity >= 0.01f;
+}
+
+
+// ---------- Debug: widget tree dump ([Debug] DumpWidgetTrees = true) ----------
+bool bDumpWidgetTrees = false;
+struct PendingDump { SDK::UUserWidget* W; int32_t Idx; ULONGLONG Due; };
+std::vector<PendingDump> g_PendingDumps;
+
+static const char* VisName(SDK::ESlateVisibility v)
+{
+    switch (v) {
+    case SDK::ESlateVisibility::Visible: return "Vis";
+    case SDK::ESlateVisibility::Collapsed: return "Col";
+    case SDK::ESlateVisibility::Hidden: return "Hid";
+    case SDK::ESlateVisibility::HitTestInvisible: return "HTI";
+    case SDK::ESlateVisibility::SelfHitTestInvisible: return "SHTI";
+    default: return "?";
+    }
+}
+
+static void DumpWidget(SDK::UWidget* w, int depth, int& lines)
+{
+    if (!w || depth > 16 || lines > 2500) return;
+    ++lines;
+    std::string line(depth * 2, ' ');
+    line += w->GetName();
+    line += " <" + (w->Class ? w->Class->GetName() : std::string("?")) + ">";
+    line += std::format(" {} op={:.2f}", VisName(w->Visibility), w->RenderOpacity);
+    const auto& tr = w->RenderTransform.Translation;
+    if (tr.X != 0.0 || tr.Y != 0.0)
+        line += std::format(" tr=({:.0f},{:.0f})", tr.X, tr.Y);
+    if (w->Slot && w->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+        const auto& ld = static_cast<SDK::UCanvasPanelSlot*>(w->Slot)->LayoutData;
+        line += std::format(" A[{:.2f},{:.2f}-{:.2f},{:.2f}] O[{:.0f},{:.0f},{:.0f},{:.0f}] Al[{:.2f},{:.2f}]",
+            ld.Anchors.Minimum.X, ld.Anchors.Minimum.Y, ld.Anchors.Maximum.X, ld.Anchors.Maximum.Y,
+            ld.Offsets.Left, ld.Offsets.Top, ld.Offsets.Right, ld.Offsets.Bottom, ld.Alignment.X, ld.Alignment.Y);
+    }
+    if (w->IsA(SDK::USizeBox::StaticClass())) {
+        auto sb = static_cast<SDK::USizeBox*>(w);
+        line += std::format(" size={:.0f}x{:.0f}", sb->WidthOverride, sb->HeightOverride);
+    }
+    SPDLOG_INFO("DUMP {}", line);
+
+    if (w->IsA(SDK::UUserWidget::StaticClass())) {
+        auto uw = static_cast<SDK::UUserWidget*>(w);
+        if (uw->WidgetTree && uw->WidgetTree->RootWidget)
+            DumpWidget(uw->WidgetTree->RootWidget, depth + 1, lines);
+    }
+    else if (w->IsA(SDK::UPanelWidget::StaticClass())) {
+        auto p = static_cast<SDK::UPanelWidget*>(w);
+        for (int i = 0; i < p->Slots.Num(); ++i)
+            if (p->Slots[i] && p->Slots[i]->Content)
+                DumpWidget(p->Slots[i]->Content, depth + 1, lines);
+    }
+}
+
+void DumpWidgetTree(SDK::UUserWidget* uw, const char* when)
+{
+    SPDLOG_INFO("DUMP ===== {} ({}) =====", uw->GetName(), when);
+    int lines = 0;
+    DumpWidget(uw, 0, lines);
+    SPDLOG_INFO("DUMP ===== end ({} lines) =====", lines);
+}
+
+void ProcessPendingDumps()
+{
+    if (g_PendingDumps.empty()) return;
+    ULONGLONG now = GetTickCount64();
+    std::erase_if(g_PendingDumps, [now](PendingDump& d) {
+        if (now < d.Due) return false;
+        if (IsObjectAlive(d.W, d.Idx))
+            DumpWidgetTree(d.W, "2s after AddToViewport");
+        return true;
+    });
+}
+
+void UpdateSharedMenus(bool bCheckViewport)
+{
+    CloneOpGuard guard;
+    std::erase_if(g_SharedMenus, [bCheckViewport](TrackedMenu& m) {
+        if (!IsObjectAlive(m.W, m.Idx) || !IsObjectAlive(m.Owner, m.OwnerIdx))
+            return true;
+        if (bCheckViewport) {
+            // Owner is not in viewport yet while its own AddToViewport runs: only "seen, then gone" means removed
+            if (m.Owner->IsInViewport())
+                m.bSeenInViewport = true;
+            else if (m.bSeenInViewport)
+                return true;
+        }
+        return false;
+    });
+
+    FrameMode mode = FrameMode::None;
+    if (bIs2PlayerRace && IsDualMonitorLayout()) {
+        bool high = false, split = false, low = false;
+        for (const auto& m : g_SharedMenus) {
+            if (!IsEffectivelyVisible(m.W, m.Owner)) continue;
+            if (m.Kind == MenuKind::DupHigh) high = true;
+            else if (m.Kind == MenuKind::Split) split = true;
+            else low = true;
+        }
+        mode = high ? FrameMode::CenterDup : split ? FrameMode::Split : low ? FrameMode::CenterDup : FrameMode::None;
+    }
+    g_FrameMode.store(static_cast<int>(mode), std::memory_order_relaxed);
+}
+
+void RegisterSharedMenu(SDK::UWidget* w, SDK::UUserWidget* owner, MenuKind kind)
+{
+    if (!w || !owner) return;
+    for (const auto& m : g_SharedMenus)
+        if (m.W == w) return;
+    g_SharedMenus.push_back({ w, w->Index, owner, owner->Index, kind, false });
+    UpdateSharedMenus(false);
+}
+
+void ClearSharedMenus()
+{
+    g_SharedMenus.clear();
+    g_FrameMode.store(static_cast<int>(FrameMode::None), std::memory_order_relaxed);
+}
+
+
+// ---------- Per-player minimap ----------
+// WBP_Race_HUD_CourseMap is just two images (track texture + live render target the game draws racers into).
+// A second instance on monitor 2 shows the same data when its images use the original's brushes.
+struct MinimapMirror
+{
+    SDK::UUserWidget* Orig = nullptr;  int32_t OrigIdx = -1;
+    SDK::UUserWidget* Clone = nullptr; int32_t CloneIdx = -1;
+    SDK::UImage* OrigImg[2]{};  int32_t OrigImgIdx[2]{ -1, -1 };
+    SDK::UImage* CloneImg[2]{}; int32_t CloneImgIdx[2]{ -1, -1 };
+};
+MinimapMirror g_Minimap;
+
+static void MirrorVisibility(SDK::UWidget* src, SDK::UWidget* dst)
+{
+    if (dst->Visibility != src->Visibility)
+        dst->SetVisibility(src->Visibility);
+    if (std::fabs(dst->RenderOpacity - src->RenderOpacity) > 0.001f)
+        dst->SetRenderOpacity(src->RenderOpacity);
+}
+
+void SyncMinimap()
+{
+    if (!g_Minimap.Clone)
+        return;
+    CloneOpGuard guard;
+    if (!IsObjectAlive(g_Minimap.Orig, g_Minimap.OrigIdx) || !IsObjectAlive(g_Minimap.Clone, g_Minimap.CloneIdx)) {
+        g_Minimap = {};
+        return;
+    }
+    MirrorVisibility(g_Minimap.Orig, g_Minimap.Clone);
+    for (int i = 0; i < 2; ++i) {
+        auto src = g_Minimap.OrigImg[i];
+        auto dst = g_Minimap.CloneImg[i];
+        if (!IsObjectAlive(src, g_Minimap.OrigImgIdx[i]) || !IsObjectAlive(dst, g_Minimap.CloneImgIdx[i]))
+            continue;
+        if (dst->Brush.ResourceObject != src->Brush.ResourceObject)
+            dst->SetBrush(src->Brush);
+        MirrorVisibility(src, dst);
+    }
+}
+
+// SEH wrapper (no C++ objects with destructors allowed here). CloneOpGuard's destructor is skipped
+// when an SEH exception unwinds, so the depth counter is reset by hand.
+static void SafeSyncMenuClones(bool bCheckViewport)
+{
+    __try {
+        SyncMenuClones(bCheckViewport);
+        UpdateSharedMenus(bCheckViewport);
+        SyncMinimap();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_CloneOpDepth = 0;
+        // pointers are suspect now, forget them rather than touch them again
+        g_MenuClones.clear();
+        g_SharedMenus.clear();
+        g_Minimap = {};
+        g_FrameMode.store(static_cast<int>(FrameMode::None), std::memory_order_relaxed);
+    }
+}
+
 SafetyHookInline ProcessEventHook{};
 
 void ProcessEvent_Hook(SDK::UObject* obj, SDK::UFunction* fn, void* parms)
@@ -210,7 +432,7 @@ void ProcessEvent_Hook(SDK::UObject* obj, SDK::UFunction* fn, void* parms)
     // unsafe_call: call() locks a mutex around the whole original, which would serialise every ProcessEvent in the game
     ProcessEventHook.unsafe_call<void>(obj, fn, parms);
 
-    if (g_CloneOpDepth > 0 || g_bIsMenuCloning || GetCurrentThreadId() != g_GameThreadId || g_MenuClones.empty())
+    if (g_CloneOpDepth > 0 || g_bIsMenuCloning || GetCurrentThreadId() != g_GameThreadId || (g_MenuClones.empty() && g_SharedMenus.empty() && g_PendingDumps.empty() && !g_Minimap.Clone))
         return;
 
     static ULONGLONG lastViewportCheck = 0;
@@ -218,59 +440,9 @@ void ProcessEvent_Hook(SDK::UObject* obj, SDK::UFunction* fn, void* parms)
     bool bCheckViewport = now - lastViewportCheck >= 100;
     if (bCheckViewport)
         lastViewportCheck = now;
-    SyncMenuClones(bCheckViewport);
-}
-
-// Clears clipping and safe-zone padding on the whole tree and stretches only the OUTERMOST SizeBox
-// of each branch to 3840x1080. Nested SizeBoxes (icons, buttons, frames) keep their own sizes.
-void UnclipAndExpand(SDK::UWidget* w, bool bInsideSizeBox = false)
-{
-    if (!w) return;
-    w->SetClipping(SDK::EWidgetClipping::Inherit);
-
-    if (w->IsA(SDK::USafeZone::StaticClass()))
-        static_cast<SDK::USafeZone*>(w)->SetSidesToPad(false, false, false, false);
-
-    if (!bInsideSizeBox && w->IsA(SDK::USizeBox::StaticClass())) {
-        auto sb = static_cast<SDK::USizeBox*>(w);
-        sb->SetWidthOverride(3840.0f);
-        sb->SetHeightOverride(1080.0f);
-        bInsideSizeBox = true;
-    }
-
-    if (w->IsA(SDK::UPanelWidget::StaticClass())) {
-        auto p = static_cast<SDK::UPanelWidget*>(w);
-        for (int i = 0; i < p->Slots.Num(); ++i) {
-            if (p->Slots[i] && p->Slots[i]->Content)
-                UnclipAndExpand(p->Slots[i]->Content, bInsideSizeBox);
-        }
-    }
-}
-
-// Shift P1 parts to Monitor 1 and P2 parts to Monitor 2 by name.
-// RenderTranslation is inherited by children, so once a branch is shifted we don't shift its children again.
-void ShiftPlayerSections(SDK::UWidget* w)
-{
-    if (!w) return;
-    w->SetClipping(SDK::EWidgetClipping::Inherit);
-
-    std::string name = w->GetName();
-    if (name.contains("P1") || name.contains("1P") || name.contains("Left")) {
-        w->SetRenderTranslation(SDK::FVector2D{ -960.0f, 0.0f });
-        return;
-    }
-    if (name.contains("P2") || name.contains("2P") || name.contains("Right")) {
-        w->SetRenderTranslation(SDK::FVector2D{ 960.0f, 0.0f });
-        return;
-    }
-
-    if (w->IsA(SDK::UPanelWidget::StaticClass())) {
-        auto p = static_cast<SDK::UPanelWidget*>(w);
-        for (int i = 0; i < p->Slots.Num(); ++i) {
-            if (p->Slots[i] && p->Slots[i]->Content)
-                ShiftPlayerSections(p->Slots[i]->Content);
-        }
-    }
+    SafeSyncMenuClones(bCheckViewport);
+    if (bCheckViewport)
+        ProcessPendingDumps();
 }
 
 template<typename T>
@@ -378,6 +550,7 @@ void Configuration()
     bDualMonitor2P = GetConfigAndLog(ini, "Dual Monitor Splitscreen", "Enabled", true);
     bHideCenterLine = GetConfigAndLog(ini, "Dual Monitor Splitscreen", "HideCenterDividerLine", true);
     bMirror2PMenus = GetConfigAndLog(ini, "Dual Monitor Splitscreen", "Mirror2PMenus", true);
+    bDumpWidgetTrees = GetConfigAndLog(ini, "Debug", "DumpWidgetTrees", false);
     
     SPDLOG_INFO("----------");
 }
@@ -483,6 +656,320 @@ void AspectRatioFOV()
     }
 }
 
+// ---------- D3D12: rearrange the presented frame (FrameMode) ----------
+// Runs on the RHI thread inside IDXGISwapChain::Present. No logging here (the spdlog sink is single-threaded):
+// errors are stored and reported from the game thread.
+std::atomic<ID3D12CommandQueue*> g_DirectQueue{ nullptr };
+std::atomic<HRESULT> g_DupError{ S_OK };
+SafetyHookInline PresentHook{};
+SafetyHookInline Present1Hook{};
+SafetyHookInline ExecuteCommandListsHook{};
+
+struct DupResources
+{
+    ID3D12Device* Device = nullptr;
+    ID3D12CommandAllocator* Alloc = nullptr;
+    ID3D12GraphicsCommandList* List = nullptr;
+    ID3D12Fence* Fence = nullptr;
+    HANDLE FenceEvent = nullptr;
+    UINT64 FenceValue = 0;
+    ID3D12Resource* Temp = nullptr;
+    UINT64 TempWidth = 0;
+    UINT TempHeight = 0;
+    DXGI_FORMAT TempFormat = DXGI_FORMAT_UNKNOWN;
+    bool bFailed = false;
+} g_Dup;
+
+static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = after;
+    return b;
+}
+
+static bool DupFail(HRESULT hr)
+{
+    g_Dup.bFailed = true;
+    g_DupError.store(hr == S_OK ? E_FAIL : hr);
+    return false;
+}
+
+// Plain C-style function (no destructors) so it can sit inside __try.
+static bool RearrangeFrame(IDXGISwapChain* swapChain, FrameMode mode)
+{
+    ID3D12CommandQueue* queue = g_DirectQueue.load();
+    if (!queue || g_Dup.bFailed)
+        return false;
+
+    IDXGISwapChain3* sc3 = nullptr;
+    if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&sc3))))
+        return false;
+    UINT bbIndex = sc3->GetCurrentBackBufferIndex();
+    ID3D12Resource* bb = nullptr;
+    HRESULT hr = sc3->GetBuffer(bbIndex, IID_PPV_ARGS(&bb));
+    sc3->Release();
+    if (FAILED(hr) || !bb)
+        return false;
+
+    D3D12_RESOURCE_DESC bbDesc = bb->GetDesc();
+    const UINT width = static_cast<UINT>(bbDesc.Width);
+    const UINT height = bbDesc.Height;
+    const UINT half = width / 2;
+    // centre 16:9 window the menus are drawn in, and how far each half moves in Split mode
+    const UINT menuW = (std::min)(half * 2, (height * 16 / 9) & ~1u);
+    const UINT menuL = (width - menuW) / 2;
+    const UINT shift = (width - menuW) / 4;
+    bool ok = false;
+
+    do {
+        // One-time setup on the swap chain's device
+        if (!g_Dup.Device) {
+            if (FAILED(hr = bb->GetDevice(IID_PPV_ARGS(&g_Dup.Device)))) { DupFail(hr); break; }
+            if (FAILED(hr = g_Dup.Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_Dup.Alloc)))) { DupFail(hr); break; }
+            if (FAILED(hr = g_Dup.Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_Dup.Alloc, nullptr, IID_PPV_ARGS(&g_Dup.List)))) { DupFail(hr); break; }
+            g_Dup.List->Close();
+            if (FAILED(hr = g_Dup.Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_Dup.Fence)))) { DupFail(hr); break; }
+            g_Dup.FenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        }
+
+        // The queue we copy on must belong to the same device as the swap chain
+        ID3D12Device* queueDevice = nullptr;
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&queueDevice))))
+            break;
+        bool sameDevice = queueDevice == g_Dup.Device;
+        queueDevice->Release();
+        if (!sameDevice)
+            break;
+
+        // Intermediate texture (D3D12 can't copy a texture region onto the same subresource)
+        if (!g_Dup.Temp || g_Dup.TempWidth != width || g_Dup.TempHeight != height || g_Dup.TempFormat != bbDesc.Format) {
+            if (g_Dup.Temp) {
+                // previous copy must be done before the old texture is released
+                if (g_Dup.Fence->GetCompletedValue() < g_Dup.FenceValue) {
+                    g_Dup.Fence->SetEventOnCompletion(g_Dup.FenceValue, g_Dup.FenceEvent);
+                    WaitForSingleObject(g_Dup.FenceEvent, 1000);
+                }
+                g_Dup.Temp->Release();
+                g_Dup.Temp = nullptr;
+            }
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td = bbDesc;
+            td.Width = width;
+            td.Alignment = 0;
+            td.MipLevels = 1;
+            td.DepthOrArraySize = 1;
+            td.SampleDesc = { 1, 0 };
+            td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            td.Flags = D3D12_RESOURCE_FLAG_NONE;
+            if (FAILED(hr = g_Dup.Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_Dup.Temp)))) { DupFail(hr); break; }
+            g_Dup.TempWidth = width;
+            g_Dup.TempHeight = height;
+            g_Dup.TempFormat = bbDesc.Format;
+        }
+
+        // Previous frame's copy must be finished before the allocator is reused
+        if (g_Dup.Fence->GetCompletedValue() < g_Dup.FenceValue) {
+            g_Dup.Fence->SetEventOnCompletion(g_Dup.FenceValue, g_Dup.FenceEvent);
+            WaitForSingleObject(g_Dup.FenceEvent, 1000);
+        }
+        if (FAILED(hr = g_Dup.Alloc->Reset())) { DupFail(hr); break; }
+        if (FAILED(hr = g_Dup.List->Reset(g_Dup.Alloc, nullptr))) { DupFail(hr); break; }
+
+        auto list = g_Dup.List;
+
+        // 1) whole back buffer -> temp
+        D3D12_RESOURCE_BARRIER b1 = Transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &b1);
+        D3D12_TEXTURE_COPY_LOCATION tmpLoc{}; tmpLoc.pResource = g_Dup.Temp; tmpLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION bbLoc{};  bbLoc.pResource = bb;          bbLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&tmpLoc, 0, 0, 0, &bbLoc, nullptr);
+
+        D3D12_RESOURCE_BARRIER b2[2] = {
+            Transition(g_Dup.Temp, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST) };
+        list->ResourceBarrier(2, b2);
+
+        // 2) temp regions -> back buffer
+        auto blit = [&](UINT srcX, UINT w, UINT dstX) {
+            if (w == 0) return;
+            D3D12_BOX box{ srcX, 0, 0, srcX + w, height, 1 };
+            list->CopyTextureRegion(&bbLoc, dstX, 0, 0, &tmpLoc, &box);
+        };
+        if (mode == FrameMode::CenterDup) {
+            // centre window onto both monitors
+            blit(menuL, menuW, (half - menuW) / 2);
+            blit(menuL, menuW, half + (half - menuW) / 2);
+        }
+        else {
+            // P1 half -> middle of monitor 1, P2 half -> middle of monitor 2, gaps filled from the untouched sides
+            const UINT halfMenu = menuW / 2;
+            blit(menuL, halfMenu, menuL - shift);
+            blit(menuL + halfMenu, halfMenu, menuL + halfMenu + shift);
+            blit(0, shift, menuL - shift + halfMenu);
+            blit(width - shift, shift, half);
+        }
+
+        D3D12_RESOURCE_BARRIER b3[2] = {
+            Transition(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+            Transition(g_Dup.Temp, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST) };
+        list->ResourceBarrier(2, b3);
+
+        if (FAILED(hr = list->Close())) { DupFail(hr); break; }
+        ID3D12CommandList* lists[] = { list };
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(g_Dup.Fence, ++g_Dup.FenceValue);
+        ok = true;
+    } while (false);
+
+    bb->Release();
+    return ok;
+}
+
+static void SafeRearrangeFrame(IDXGISwapChain* swapChain)
+{
+    auto mode = static_cast<FrameMode>(g_FrameMode.load(std::memory_order_relaxed));
+    if (mode == FrameMode::None)
+        return;
+    __try {
+        RearrangeFrame(swapChain, mode);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_Dup.bFailed = true;
+        g_DupError.store(static_cast<HRESULT>(GetExceptionCode()));
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE Present_Hook(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
+{
+    if (!(flags & DXGI_PRESENT_TEST))
+        SafeRearrangeFrame(swapChain);
+    return PresentHook.unsafe_call<HRESULT>(swapChain, syncInterval, flags);
+}
+
+static HRESULT STDMETHODCALLTYPE Present1_Hook(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* params)
+{
+    if (!(flags & DXGI_PRESENT_TEST))
+        SafeRearrangeFrame(swapChain);
+    return Present1Hook.unsafe_call<HRESULT>(swapChain, syncInterval, flags, params);
+}
+
+// Only used to learn the game's direct queue
+static void STDMETHODCALLTYPE ExecuteCommandLists_Hook(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists)
+{
+    if (!g_DirectQueue.load(std::memory_order_relaxed) && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        ID3D12CommandQueue* expected = nullptr;
+        if (g_DirectQueue.compare_exchange_strong(expected, queue))
+            queue->AddRef();
+    }
+    ExecuteCommandListsHook.unsafe_call<void>(queue, count, lists);
+}
+
+// Gets Present / Present1 / ExecuteCommandLists addresses from a throwaway device + swap chain
+static bool InstallD3D12Hooks()
+{
+    bool ok = false;
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{ sizeof(WNDCLASSEXW) };
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = inst;
+    wc.lpszClassName = L"CrossWorldsFixDummy";
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, inst, nullptr);
+
+    IDXGIFactory4* factory = nullptr;
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    IDXGISwapChain1* sc = nullptr;
+
+    do {
+        if (!hwnd) { SPDLOG_ERROR("D3D12: dummy window failed"); break; }
+        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) { SPDLOG_ERROR("D3D12: CreateDXGIFactory1 failed 0x{:x}", (unsigned)hr); break; }
+        hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+        if (FAILED(hr)) { SPDLOG_ERROR("D3D12: D3D12CreateDevice failed 0x{:x}", (unsigned)hr); break; }
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+        if (FAILED(hr)) { SPDLOG_ERROR("D3D12: CreateCommandQueue failed 0x{:x}", (unsigned)hr); break; }
+        DXGI_SWAP_CHAIN_DESC1 sd{};
+        sd.Width = 64;
+        sd.Height = 64;
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = 2;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        hr = factory->CreateSwapChainForHwnd(queue, hwnd, &sd, nullptr, nullptr, &sc);
+        if (FAILED(hr)) { SPDLOG_ERROR("D3D12: CreateSwapChainForHwnd failed 0x{:x}", (unsigned)hr); break; }
+
+        void** scVtbl = *reinterpret_cast<void***>(sc);
+        void** qVtbl = *reinterpret_cast<void***>(queue);
+
+        PresentHook = safetyhook::create_inline(scVtbl[8], reinterpret_cast<void*>(&Present_Hook));
+        Present1Hook = safetyhook::create_inline(scVtbl[22], reinterpret_cast<void*>(&Present1_Hook));
+        ExecuteCommandListsHook = safetyhook::create_inline(qVtbl[10], reinterpret_cast<void*>(&ExecuteCommandLists_Hook));
+        ok = PresentHook && ExecuteCommandListsHook;
+        if (!ok) SPDLOG_ERROR("D3D12: failed to hook Present/ExecuteCommandLists");
+    } while (false);
+
+    if (sc) sc->Release();
+    if (queue) queue->Release();
+    if (device) device->Release();
+    if (factory) factory->Release();
+    if (hwnd) DestroyWindow(hwnd);
+    UnregisterClassW(wc.lpszClassName, inst);
+    return ok;
+}
+
+// ---------- Widget lookup by name ----------
+// Blueprint widget classes here all derive from game classes (UUnionRaceUI, UReadyWindow, UUnionUISceneBase...).
+// When the game updates, those parents change size and every member offset in the dumped SDK shifts:
+// reading e.g. hud2P->CanvasPanel_P1_HUD then returns garbage and crashes (race start crash).
+// The widget tree itself (UUserWidget::WidgetTree, UPanelWidget::Slots, UPanelSlot::Content) is engine-side
+// and stable, and designer widgets are named exactly like the BP members, so we look them up by name instead.
+class WidgetIndex
+{
+public:
+    explicit WidgetIndex(SDK::UUserWidget* owner)
+    {
+        if (owner && owner->WidgetTree && owner->WidgetTree->RootWidget)
+            Add(owner->WidgetTree->RootWidget);
+    }
+
+    SDK::UWidget* operator[](const char* name) const
+    {
+        auto it = m_byName.find(name);
+        return it != m_byName.end() ? it->second : nullptr;
+    }
+
+    template<typename T>
+    T* Get(const char* name) const { return static_cast<T*>((*this)[name]); }
+
+    bool Contains(const SDK::UObject* w) const { return m_all.contains(w); }
+
+private:
+    void Add(SDK::UWidget* w)
+    {
+        if (!w || m_all.contains(w)) return;
+        m_all.insert(w);
+        m_byName.emplace(w->GetName(), w);
+        if (w->IsA(SDK::UPanelWidget::StaticClass())) {
+            auto p = static_cast<SDK::UPanelWidget*>(w);
+            for (int i = 0; i < p->Slots.Num(); ++i)
+                if (p->Slots[i] && p->Slots[i]->Content)
+                    Add(p->Slots[i]->Content);
+        }
+    }
+
+    std::unordered_map<std::string, SDK::UWidget*> m_byName;
+    std::unordered_set<const SDK::UObject*> m_all;
+};
+
 // Anchors a widget's CanvasPanelSlot to the given region and zeroes its offsets
 static void SetSlotAnchors(SDK::UWidget* widget, const SDK::FAnchors& anchors)
 {
@@ -491,6 +978,18 @@ static void SetSlotAnchors(SDK::UWidget* widget, const SDK::FAnchors& anchors)
     auto slot = static_cast<SDK::UCanvasPanelSlot*>(widget->Slot);
     slot->SetAnchors(anchors);
     slot->SetOffsets(SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f });
+}
+
+// Full CanvasPanelSlot layout. For stretched anchors offsets are margins (L,T,R,B), for point anchors (X,Y,W,H).
+static void SetSlotLayout(SDK::UWidget* widget, float minX, float minY, float maxX, float maxY,
+                          const SDK::FMargin& offsets, float alignX, float alignY)
+{
+    if (!widget || !widget->Slot || !widget->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass()))
+        return;
+    auto slot = static_cast<SDK::UCanvasPanelSlot*>(widget->Slot);
+    slot->SetAnchors(SDK::FAnchors{ SDK::FVector2D{ minX, minY }, SDK::FVector2D{ maxX, maxY } });
+    slot->SetOffsets(offsets);
+    slot->SetAlignment(SDK::FVector2D{ alignX, alignY });
 }
 
 static void SetTranslation(SDK::UWidget* w, float x, bool bUnclip = false)
@@ -517,6 +1016,48 @@ static SDK::UUserWidget* CreateMonitor2Clone(SDK::UUserWidget* outer, SDK::UClas
     return clone;
 }
 
+static SDK::USizeBox* GetRootScaleBoxSizeBox(SDK::UUserWidget* uw)
+{
+    if (!uw->WidgetTree || !uw->WidgetTree->RootWidget || !uw->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass()))
+        return nullptr;
+    auto scaleBox = static_cast<SDK::UScaleBox*>(uw->WidgetTree->RootWidget);
+    if (!scaleBox->Slots.IsValidIndex(0) || !scaleBox->Slots[0] || !scaleBox->Slots[0]->Content
+        || !scaleBox->Slots[0]->Content->IsA(SDK::USizeBox::StaticClass()))
+        return nullptr;
+    return static_cast<SDK::USizeBox*>(scaleBox->Slots[0]->Content);
+}
+
+static void CreateMinimapMirror(SDK::UUserWidget* hud, SDK::UWidget* panel, SDK::UUserWidget* map)
+{
+    g_Minimap = {};
+    if (!map || !map->IsA(SDK::UUserWidget::StaticClass()) || !map->Class || !panel || !panel->IsA(SDK::UCanvasPanel::StaticClass()))
+        return;
+
+    g_bIsMenuCloning = true;
+    auto clone = SDK::UWidgetBlueprintLibrary::Create(hud, map->Class, nullptr);
+    g_bIsMenuCloning = false;
+    if (!clone)
+        return;
+    if (!static_cast<SDK::UCanvasPanel*>(panel)->AddChildToCanvas(clone))
+        return;
+    SetSlotLayout(clone, 0.5f, 0.5f, 0.5f, 0.5f, SDK::FMargin{ 60.0f, 0.0f, 1024.0f, 1024.0f }, 0.0f, 0.5f);
+
+    WidgetIndex wo(map), wc(clone);
+    const char* imgs[2] = { "DMY_CourseMapTexture", "DMY_CourseMapTextureRT" };
+    g_Minimap.Orig = map;    g_Minimap.OrigIdx = map->Index;
+    g_Minimap.Clone = clone; g_Minimap.CloneIdx = clone->Index;
+    for (int i = 0; i < 2; ++i) {
+        auto o = wo[imgs[i]], c = wc[imgs[i]];
+        if (o && c && o->IsA(SDK::UImage::StaticClass()) && c->IsA(SDK::UImage::StaticClass())) {
+            g_Minimap.OrigImg[i] = static_cast<SDK::UImage*>(o);  g_Minimap.OrigImgIdx[i] = o->Index;
+            g_Minimap.CloneImg[i] = static_cast<SDK::UImage*>(c); g_Minimap.CloneImgIdx[i] = c->Index;
+        }
+    }
+    SPDLOG_INFO("HUD: Dual-Monitor minimap mirrored to monitor 2 ({} / {} images linked)",
+        g_Minimap.CloneImg[0] ? "texture" : "-", g_Minimap.CloneImg[1] ? "render target" : "-");
+    SyncMinimap();
+}
+
 void OnWidgetAddToViewport(SDK::UObject* obj)
 {
     if (!obj->Class || !obj->Class->Class)
@@ -524,18 +1065,32 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
 
     g_GameThreadId = GetCurrentThreadId();
 
-    // Our own clones (and anything created while we are cloning) must not be processed:
-    // that is what caused the CourseSelect recursion / race-start crash.
+    // Our own clones (and anything created while we are cloning) must not be processed
     if (g_bIsMenuCloning || IsMenuClone(obj))
         return;
 
-    // Use locals: the code below can re-enter this function (clone AddToViewport), which used to
-    // overwrite the global WidgetObject/sWidgetName in the middle of processing.
+    // Locals: the code below can re-enter this function (clone AddToViewport)
     const std::string name = obj->GetName();
     if (WidgetObject != obj) {
         WidgetObject = obj;
         sWidgetName = name;
         SPDLOG_INFO("HUD: Widgets: {} @ 0x{:x}", name, reinterpret_cast<uintptr_t>(obj));
+    }
+
+    if (!obj->IsA(SDK::UUserWidget::StaticClass()))
+        return;
+    auto userWidget = static_cast<SDK::UUserWidget*>(obj);
+
+    if (bDumpWidgetTrees) {
+        static const char* kDumpFilter[] = { "_M2", "Race_HUD_Player", "PauseMenu", "CourseSelect", "ClassSelect",
+                                             "Rival", "RaceBefore", "Popup_Window_Hint", "Loading_BG", "Result" };
+        for (auto f : kDumpFilter) {
+            if (name.contains(f)) {
+                // Children created in Construct don't exist yet: dump again a bit later
+                g_PendingDumps.push_back({ userWidget, userWidget->Index, GetTickCount64() + 2000 });
+                break;
+            }
+        }
     }
 
     const float widthOffset = (2160.0f * fAspectRatio - 3840.0f) / 2.0f;
@@ -546,57 +1101,53 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
     // ---------- 1P race HUD ----------
     if (name.contains("WBP_Race_HUD_Player01_C")) {
         bIs2PlayerRace = false;
-        auto hud = static_cast<SDK::UWBP_Race_HUD_Player01_C*>(obj);
+        WidgetIndex w(userWidget);
 
-        if (hud->WidgetTree && hud->WidgetTree->RootWidget && hud->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass())) {
-            auto scaleBox = static_cast<SDK::UScaleBox*>(hud->WidgetTree->RootWidget);
-            if (scaleBox->Slots.IsValidIndex(0) && scaleBox->Slots[0] && scaleBox->Slots[0]->Content
-                && scaleBox->Slots[0]->Content->IsA(SDK::USizeBox::StaticClass())) {
-                auto sizeBox = static_cast<SDK::USizeBox*>(scaleBox->Slots[0]->Content);
-
-                if (bSpanRaceHUD) {
-                    if (fAspectRatio > fNativeAspect) {
-                        sizeBox->SetWidthOverride(2160.0f * fAspectRatio);
-                        sizeBox->SetHeightOverride(2160.0f);
-                    }
-                    else {
-                        sizeBox->SetWidthOverride(3840.0f);
-                        sizeBox->SetHeightOverride(3840.0f / fAspectRatio);
-                    }
-
-                    if (hud->CLIP_TextDirection && hud->CLIP_TextDirection->Slot) {
-                        auto clippingPanel = static_cast<SDK::UCanvasPanelSlot*>(hud->CLIP_TextDirection->Slot);
-                        if (fAspectRatio > fNativeAspect)
-                            clippingPanel->SetOffsets(SDK::FMargin(0.0f, 0.0f, 2160.0f * fAspectRatio, 2160.0f));
-                        else
-                            clippingPanel->SetOffsets(SDK::FMargin(0.0f, 0.0f, 3840.0f, 3840.0f / fAspectRatio));
-                    }
+        if (auto sizeBox = GetRootScaleBoxSizeBox(userWidget)) {
+            if (bSpanRaceHUD) {
+                if (fAspectRatio > fNativeAspect) {
+                    sizeBox->SetWidthOverride(2160.0f * fAspectRatio);
+                    sizeBox->SetHeightOverride(2160.0f);
+                }
+                else {
+                    sizeBox->SetWidthOverride(3840.0f);
+                    sizeBox->SetHeightOverride(3840.0f / fAspectRatio);
                 }
 
-                if (bFixHUD) {
-                    // Disable clipping so that player markers don't disappear outside 16:9 bounds
-                    sizeBox->SetClipping(SDK::EWidgetClipping::Inherit);
+                auto clip = w["CLIP_TextDirection"];
+                if (clip && clip->Slot && clip->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+                    auto clippingPanel = static_cast<SDK::UCanvasPanelSlot*>(clip->Slot);
+                    if (fAspectRatio > fNativeAspect)
+                        clippingPanel->SetOffsets(SDK::FMargin(0.0f, 0.0f, 2160.0f * fAspectRatio, 2160.0f));
+                    else
+                        clippingPanel->SetOffsets(SDK::FMargin(0.0f, 0.0f, 3840.0f, 3840.0f / fAspectRatio));
+                }
+            }
 
-                    // Span background of pause menu
-                    if (hud->WBP_PauseMenu && hud->WBP_PauseMenu->WidgetTree && hud->WBP_PauseMenu->WidgetTree->RootWidget) {
-                        auto pauseScaleBox = static_cast<SDK::UScaleBox*>(hud->WBP_PauseMenu->WidgetTree->RootWidget);
+            if (bFixHUD) {
+                // Disable clipping so that player markers don't disappear outside 16:9 bounds
+                sizeBox->SetClipping(SDK::EWidgetClipping::Inherit);
 
-                        if (pauseScaleBox->Slots.IsValidIndex(0) && pauseScaleBox->Slots[0] && pauseScaleBox->Slots[0]->Content) {
-                            auto panel = static_cast<SDK::UCanvasPanel*>(pauseScaleBox->Slots[0]->Content);
-                            panel->SetClipping(SDK::EWidgetClipping::Inherit);
+                // Span background of pause menu
+                auto pauseMenu = w.Get<SDK::UUserWidget>("WBP_PauseMenu");
+                if (pauseMenu && pauseMenu->IsA(SDK::UUserWidget::StaticClass()) && pauseMenu->WidgetTree && pauseMenu->WidgetTree->RootWidget) {
+                    auto pauseScaleBox = static_cast<SDK::UScaleBox*>(pauseMenu->WidgetTree->RootWidget);
+                    if (pauseScaleBox->IsA(SDK::UScaleBox::StaticClass()) && pauseScaleBox->Slots.IsValidIndex(0)
+                        && pauseScaleBox->Slots[0] && pauseScaleBox->Slots[0]->Content) {
+                        auto panel = static_cast<SDK::UCanvasPanel*>(pauseScaleBox->Slots[0]->Content);
+                        panel->SetClipping(SDK::EWidgetClipping::Inherit);
 
-                            if (panel->Slots.IsValidIndex(3)) {
-                                auto backgroundBlurSlot = static_cast<SDK::UCanvasPanelSlot*>(panel->Slots[2]);
-                                auto bgBlackSlot = static_cast<SDK::UCanvasPanelSlot*>(panel->Slots[3]);
+                        if (panel->Slots.IsValidIndex(3)) {
+                            auto backgroundBlurSlot = static_cast<SDK::UCanvasPanelSlot*>(panel->Slots[2]);
+                            auto bgBlackSlot = static_cast<SDK::UCanvasPanelSlot*>(panel->Slots[3]);
 
-                                if (fAspectRatio > fNativeAspect) {
-                                    backgroundBlurSlot->SetOffsets(SDK::FMargin(-widthOffset, 0.0f, -widthOffset, 0.0f));
-                                    bgBlackSlot->SetOffsets(SDK::FMargin(-widthOffset, 0.0f, -widthOffset, 0.0f));
-                                }
-                                else {
-                                    backgroundBlurSlot->SetOffsets(SDK::FMargin(0.0f, -heightOffset, 0.0f, -heightOffset));
-                                    bgBlackSlot->SetOffsets(SDK::FMargin(0.0f, -heightOffset, 0.0f, -heightOffset));
-                                }
+                            if (fAspectRatio > fNativeAspect) {
+                                backgroundBlurSlot->SetOffsets(SDK::FMargin(-widthOffset, 0.0f, -widthOffset, 0.0f));
+                                bgBlackSlot->SetOffsets(SDK::FMargin(-widthOffset, 0.0f, -widthOffset, 0.0f));
+                            }
+                            else {
+                                backgroundBlurSlot->SetOffsets(SDK::FMargin(0.0f, -heightOffset, 0.0f, -heightOffset));
+                                bgBlackSlot->SetOffsets(SDK::FMargin(0.0f, -heightOffset, 0.0f, -heightOffset));
                             }
                         }
                     }
@@ -612,193 +1163,109 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
     if (name.contains("WBP_Ready_M1_C") || name.contains("WBP_CMN_MainMenu") || name.contains("WBP_TitleMenu") || name.contains("WBP_TopMenu")) {
         bIs2PlayerRace = false;
         DestroyAllMenuClones();
+        ClearSharedMenus();
     }
-    else if (!g_MenuClones.empty()) {
-        // Also covers Loading/Transition/BlackBoard and the 2P race HUD: drop clones whose original is gone.
+    else if (!g_MenuClones.empty() || !g_SharedMenus.empty()) {
+        // Also covers Loading/Transition/BlackBoard and the 2P race HUD: drop entries whose original is gone.
         SyncMenuClones(true);
+        UpdateSharedMenus(true);
+    }
+
+    // Report D3D12 duplication errors from the game thread (the RHI thread can't log safely)
+    static bool bDupErrorLogged = false;
+    if (!bDupErrorLogged && g_DupError.load() != S_OK) {
+        bDupErrorLogged = true;
+        SPDLOG_ERROR("D3D12: frame duplication disabled after error 0x{:x}", static_cast<unsigned>(g_DupError.load()));
     }
 
     // ---------- 2P race HUD ----------
     if (name.contains("WBP_Race_HUD_Player02_C")) {
         bIs2PlayerRace = true;
-        auto hud2P = static_cast<SDK::UWBP_Race_HUD_Player02_C*>(obj);
+        WidgetIndex w(userWidget);
 
-        if (hud2P->WidgetTree && hud2P->WidgetTree->RootWidget && hud2P->WidgetTree->RootWidget->IsA(SDK::UScaleBox::StaticClass())) {
-            auto scaleBox = static_cast<SDK::UScaleBox*>(hud2P->WidgetTree->RootWidget);
-            if (scaleBox->Slots.IsValidIndex(0) && scaleBox->Slots[0] && scaleBox->Slots[0]->Content
-                && scaleBox->Slots[0]->Content->IsA(SDK::USizeBox::StaticClass())) {
-                auto sizeBox = static_cast<SDK::USizeBox*>(scaleBox->Slots[0]->Content);
+        if (auto sizeBox = GetRootScaleBoxSizeBox(userWidget)) {
+            // Resolution not known yet -> overriding with 0x0 would make the whole HUD vanish
+            if ((bDualLayout || bSpanRaceHUD) && iCurrentResX > 0 && iCurrentResY > 0) {
+                // Keep the HUD's 2160-unit design height (scale 0.5 at 1080p, like 1P) and widen to the real aspect.
+                // Using the pixel resolution (3840x1080) here made the whole HUD twice as big and cut it off.
+                sizeBox->SetWidthOverride(2160.0f * fAspectRatio);
+                sizeBox->SetHeightOverride(2160.0f);
 
-                // Resolution not known yet -> overriding with 0x0 would make the whole HUD vanish
-                if ((bDualLayout || bSpanRaceHUD) && iCurrentResX > 0 && iCurrentResY > 0) {
-                    sizeBox->SetWidthOverride(static_cast<float>(iCurrentResX));
-                    sizeBox->SetHeightOverride(static_cast<float>(iCurrentResY));
+                // Layout from the widget tree dump:
+                //   CanvasPanel_141 (3440x1944 centred safe area)
+                //     CanvasPanel_Player01 / _Player02 (1720 wide halves, designed for a 16:9 screen split in two)
+                //       CanvasPanel_P1_HUD / _P1_StartInfo ...
+                //     WBP_Race_HUD_CourseMap (shared minimap, centred)
+                // On two monitors each player gets a whole 16:9 screen: the safe area spans everything and
+                // each player panel becomes that monitor's 90% safe area.
+                const float fullW = 2160.0f * fAspectRatio;
+                const float monitorW = fullW / 2.0f;
+                const float sideMargin = monitorW * 0.05f;   // 90% safe width per monitor, like 1P
 
-                    const SDK::FAnchors anchorsP1{ SDK::FVector2D{ 0.0, 0.0 }, SDK::FVector2D{ 0.5, 1.0 } };
-                    const SDK::FAnchors anchorsP2{ SDK::FVector2D{ 0.5, 0.0 }, SDK::FVector2D{ 1.0, 1.0 } };
+                SetSlotLayout(w["CanvasPanel_141"], 0.0f, 0.0f, 1.0f, 1.0f, SDK::FMargin{ 0.0f, 108.0f, 0.0f, 108.0f }, 0.0f, 0.0f);
+                SetSlotLayout(w["CanvasPanel_Player01"], 0.0f, 0.0f, 0.5f, 1.0f, SDK::FMargin{ sideMargin, 0.0f, sideMargin, 0.0f }, 0.0f, 0.0f);
+                SetSlotLayout(w["CanvasPanel_Player02"], 0.5f, 0.0f, 1.0f, 1.0f, SDK::FMargin{ sideMargin, 0.0f, sideMargin, 0.0f }, 0.0f, 0.0f);
 
-                    // Player 1 -> left monitor, Player 2 -> right monitor
-                    SetSlotAnchors(hud2P->CanvasPanel_P1_HUD, anchorsP1);
-                    SetSlotAnchors(hud2P->CanvasPanel_P2_HUD, anchorsP2);
-                    SetSlotAnchors(hud2P->CanvasPanel_ItemWarningArea_P1, anchorsP1);
-                    SetSlotAnchors(hud2P->CanvasPanel_ItemWarningArea_P2, anchorsP2);
-                    SetSlotAnchors(hud2P->CanvasPanel_P1_StartInfo, anchorsP1);
-                    SetSlotAnchors(hud2P->CanvasPanel_P2_StartInfo, anchorsP2);
+                // The author's version anchored these to half of an already-half panel: stretch them over their panel
+                for (auto n : { "CanvasPanel_P1_HUD", "CanvasPanel_P2_HUD", "CanvasPanel_P1_StartInfo", "CanvasPanel_P2_StartInfo" })
+                    SetSlotLayout(w[n], 0.0f, 0.0f, 1.0f, 1.0f, SDK::FMargin{ 0.0f, 0.0f, 0.0f, 0.0f }, 0.0f, 0.0f);
 
-                    // Physical monitor bezels already separate the screens
-                    if (bDualLayout && bHideCenterLine && hud2P->VerticalLine)
-                        hud2P->VerticalLine->SetVisibility(SDK::ESlateVisibility::Hidden);
-                }
+                // Minimap per player: original on monitor 1 next to the bezel, a mirrored copy on monitor 2
+                auto map = w.Get<SDK::UUserWidget>("WBP_Race_HUD_CourseMap");
+                SetSlotLayout(map, 0.5f, 0.5f, 0.5f, 0.5f, SDK::FMargin{ -60.0f, 0.0f, 1024.0f, 1024.0f }, 1.0f, 0.5f);
+                CreateMinimapMirror(userWidget, w["CanvasPanel_141"], map);
 
-                if (bFixHUD) {
-                    sizeBox->SetClipping(SDK::EWidgetClipping::Inherit);
-                    SDK::UWidget* unclip[] = {
-                        hud2P->CanvasPanel_0, hud2P->CanvasPanel_P1_HUD, hud2P->CanvasPanel_P2_HUD,
-                        hud2P->WBP_Race_HUD_Sub_Aiming_P1, hud2P->WBP_Race_HUD_Sub_Aiming_P2,
-                        hud2P->WBP_Race_HUD_Sub_Targeted_P1, hud2P->WBP_Race_HUD_Sub_Targeted_P2 };
-                    for (auto w : unclip)
-                        if (w) w->SetClipping(SDK::EWidgetClipping::Inherit);
-                }
+                // Physical monitor bezels already separate the screens
+                if (bDualLayout && bHideCenterLine)
+                    if (auto line = w["VerticalLine"])
+                        line->SetVisibility(SDK::ESlateVisibility::Hidden);
+            }
+
+            if (bFixHUD) {
+                sizeBox->SetClipping(SDK::EWidgetClipping::Inherit);
+                for (auto n : { "CanvasPanel_0", "CanvasPanel_P1_HUD", "CanvasPanel_P2_HUD",
+                                "WBP_Race_HUD_Sub_Aiming_P1", "WBP_Race_HUD_Sub_Aiming_P2",
+                                "WBP_Race_HUD_Sub_Targeted_P1", "WBP_Race_HUD_Sub_Targeted_P2" })
+                    if (auto x = w[n]) x->SetClipping(SDK::EWidgetClipping::Inherit);
             }
         }
     }
 
-    // ---------- 2P character / machine select ----------
-    // UCharaMachineSelectsBase is also the base of the 1P select screen: only treat it as 2P when it has 2+ players.
-    bool bIsCharaSelect2P = name.contains("WBP_MachineCharaSelect_M2");
-    if (!bIsCharaSelect2P && obj->IsA(SDK::UCharaMachineSelectsBase::StaticClass()))
-        bIsCharaSelect2P = static_cast<SDK::UCharaMachineSelectsBase*>(obj)->CharaMachineSelectList.Num() >= 2;
-
-    if (bIsCharaSelect2P) {
+    // ---------- Per-player 2P screens (chara/machine select, gadgets, GP results) ----------
+    // Vanilla centred 16:9 window, shown whole on both monitors like every other 2P menu.
+    const bool bIsPlayerScreen = name.contains("WBP_MachineCharaSelect_M2") ||
+                                 name.contains("GadgetCutom_M2") || name.contains("GadgetCustom_M2") ||
+                                 name.contains("WBP_Result_GP_Player0204");
+    if (bIsPlayerScreen) {
         bIs2PlayerRace = true;
-        auto charaSelects = static_cast<SDK::UCharaMachineSelectsBase*>(obj);
-
-        if (bDualMenus && obj->IsA(SDK::UCharaMachineSelectsBase::StaticClass())) {
-            SPDLOG_INFO("HUD: Applying Dual-Monitor layout to {}", name);
-
-            if (charaSelects->WidgetTree && charaSelects->WidgetTree->RootWidget)
-                UnclipAndExpand(charaSelects->WidgetTree->RootWidget);
-
-            // Index 0 = P1 -> Monitor 1, Index 1 = P2 -> Monitor 2
-            auto& list = charaSelects->CharaMachineSelectList;
-            if (list.IsValidIndex(0)) SetTranslation(list[0], -960.0f, true);
-            if (list.IsValidIndex(1)) SetTranslation(list[1], 960.0f, true);
-
-            // Shared character icon grid and gadget counter: Monitor 1
-            SetTranslation(charaSelects->WBP_CharaSelect_Sub_Window, -960.0f, true);
-            SetTranslation(charaSelects->WBP_CMN_GadgetCount, -960.0f);
+        if (bDualMenus && g_bPixelDuplication) {
+            SPDLOG_INFO("HUD: Dual-Monitor 2P screen {} -> centre window mirrored to both monitors", name);
+            RegisterSharedMenu(userWidget, userWidget, MenuKind::DupLow);
         }
     }
 
-    // ---------- 2P gadget customisation ----------
-    if (name.contains("GadgetCutom_M2") || name.contains("GadgetCustom_M2")) {
-        bIs2PlayerRace = true;
-        auto gadgetDiv = static_cast<SDK::UUserWidget*>(obj);
-        if (bDualMenus && gadgetDiv->WidgetTree && gadgetDiv->WidgetTree->RootWidget) {
-            SPDLOG_INFO("HUD: Applying Dual-Monitor layout to {}", name);
-            UnclipAndExpand(gadgetDiv->WidgetTree->RootWidget);
-            ShiftPlayerSections(gadgetDiv->WidgetTree->RootWidget);
-        }
-    }
-
-    // ---------- 2P ready screen ----------
+    // ---------- Ready screen: whole window on both monitors ("READY?" / "GO!" run across the middle) ----------
+    // It sits on top of the course select (a shared menu), which already selects CenterDup.
     if (name.contains("WBP_Ready_M2_C")) {
         bIs2PlayerRace = true;
-        auto ready2P = static_cast<SDK::UWBP_Ready_M2_C*>(obj);
-
-        if (bDualMenus) {
-            SPDLOG_INFO("HUD: Applying Dual-Monitor layout to WBP_Ready_M2_C");
-
-            if (ready2P->WidgetTree && ready2P->WidgetTree->RootWidget)
-                UnclipAndExpand(ready2P->WidgetTree->RootWidget);
-
-            const SDK::FAnchors anchorsFull{ SDK::FVector2D{ 0.0, 0.0 }, SDK::FVector2D{ 1.0, 1.0 } };
-            const SDK::FAnchors anchorsP1{ SDK::FVector2D{ 0.0, 0.0 }, SDK::FVector2D{ 0.5, 1.0 } };
-            const SDK::FAnchors anchorsP2{ SDK::FVector2D{ 0.5, 0.0 }, SDK::FVector2D{ 1.0, 1.0 } };
-
-            // Fullscreen backgrounds
-            SetSlotAnchors(ready2P->BG_Black, anchorsFull);
-            SetSlotAnchors(ready2P->BG_Light, anchorsFull);
-
-            // P1 -> left monitor
-            SetSlotAnchors(ready2P->Base_BG_P1, anchorsP1);
-            SetSlotAnchors(ready2P->Base_BG_Shadow_P1, anchorsP1);
-            SetSlotAnchors(ready2P->RaceFlag_Left_P1, anchorsP1);
-
-            // P2 -> right monitor
-            SetSlotAnchors(ready2P->Base_BG_P2, anchorsP2);
-            SetSlotAnchors(ready2P->Base_BG_Shadow_P2, anchorsP2);
-            SetSlotAnchors(ready2P->RaceFlag_Right_P2, anchorsP2);
-
-            // Selection cards
-            SetTranslation(ready2P->WBP_Ready_Sub_CharaWindow_P1P3, -960.0f, true);
-            SetTranslation(ready2P->WBP_Ready_Sub_Gadget_P1, -960.0f, true);
-            SetTranslation(ready2P->WBP_Window_MachineParameter_P1, -960.0f, true);
-            SetTranslation(ready2P->WBP_Ready_Sub_CharaWindow_P2P4, 960.0f, true);
-            SetTranslation(ready2P->WBP_Ready_Sub_Gadget_P2, 960.0f, true);
-            SetTranslation(ready2P->WBP_Window_MachineParameter_P2, 960.0f, true);
-
-            // Standby text and buttons on Monitor 1
-            SetTranslation(ready2P->WBP_Ready_Sub_StandByText, -960.0f);
-            SetTranslation(ready2P->WBP_CMN_Sub_BoxBtn, -960.0f);
-
-            // "GO!" banner: original on Monitor 1, clone on Monitor 2.
-            // The clone copies the original's visibility instead of being forced visible
-            // (it used to sit on Monitor 2 from the moment the Ready screen opened).
-            auto decide = ready2P->WBP_Ready_Sub_Decide;
-            if (decide && decide->Class) {
-                SetTranslation(decide, -960.0f, true);
-                if (auto clone = CreateMonitor2Clone(ready2P, decide->Class, 10, 960.0f))
-                    RegisterMenuClone(clone, ready2P, decide, decide->Class->GetName(), true);
+        if (bDualMenus && g_bPixelDuplication) {
+            WidgetIndex w(userWidget);
+            RegisterSharedMenu(userWidget, userWidget, MenuKind::DupLow);
+            if (auto decide = w.Get<SDK::UUserWidget>("WBP_Ready_Sub_Decide"); decide && decide->IsA(SDK::UUserWidget::StaticClass())) {
+                WidgetIndex dw(decide);
+                RegisterSharedMenu(dw["TXT_GO"], userWidget, MenuKind::DupHigh);
             }
         }
     }
 
-    // ---------- Pause menu (2P only: in 1P it must stay centred) ----------
-    if (name.contains("WBP_PauseMenu_C") && bDualMenus && bIs2PlayerRace) {
-        auto pauseMenu = static_cast<SDK::UWBP_PauseMenu_C*>(obj);
-        SPDLOG_INFO("HUD: Applying Dual-Monitor layout to WBP_PauseMenu_C");
-
-        if (pauseMenu->WidgetTree && pauseMenu->WidgetTree->RootWidget) {
-            auto root = pauseMenu->WidgetTree->RootWidget;
-            root->SetClipping(SDK::EWidgetClipping::Inherit);
-
-            // Expand blur / black background to both monitors
-            if (root->IsA(SDK::UScaleBox::StaticClass())) {
-                auto pauseScaleBox = static_cast<SDK::UScaleBox*>(root);
-                if (pauseScaleBox->Slots.IsValidIndex(0) && pauseScaleBox->Slots[0] && pauseScaleBox->Slots[0]->Content
-                    && pauseScaleBox->Slots[0]->Content->IsA(SDK::UCanvasPanel::StaticClass())) {
-                    auto panel = static_cast<SDK::UCanvasPanel*>(pauseScaleBox->Slots[0]->Content);
-                    panel->SetClipping(SDK::EWidgetClipping::Inherit);
-                    for (int i = 0; i < panel->Slots.Num(); ++i) {
-                        auto slot = static_cast<SDK::UCanvasPanelSlot*>(panel->Slots[i]);
-                        if (!slot || !slot->Content) continue;
-                        std::string childName = slot->Content->GetName();
-                        if (childName.contains("Blur") || childName.contains("Black") || childName.contains("BG"))
-                            slot->SetOffsets(SDK::FMargin(-960.0f, 0.0f, -960.0f, 0.0f));
-                    }
-                }
-            }
-        }
-
-        // Owner_Player_Index is 0-based: 0 = P1 -> Monitor 1, 1 = P2 -> Monitor 2
-        const float shift = (pauseMenu->Owner_Player_Index == 1) ? 960.0f : -960.0f;
-        SDK::UWidget* shared[] = {
-            pauseMenu->VBButton, pauseMenu->TXT_ClassName, pauseMenu->Line, pauseMenu->HorizontalBox_RSR,
-            pauseMenu->WBP_CMN_PlayerNumber_Big, pauseMenu->WBP_CMN_PlayerNumber_Big_1P, pauseMenu->WBP_CMN_PlayerNumber_Big_P2,
-            pauseMenu->WS_Icon_Active, pauseMenu->WBP_FooterMenu };
-        for (auto w : shared)
-            SetTranslation(w, shift);
-
-        SetTranslation(pauseMenu->Overlay_Option_Btn_03_P1, -960.0f);
-        SetTranslation(pauseMenu->WidgetSwitcher_P1, -960.0f);
-        SetTranslation(pauseMenu->WBP_GadgetCustom_Sub_GadgetPlate_P1, -960.0f);
-        SetTranslation(pauseMenu->Overlay_Option_Btn_03_P2, 960.0f);
-        SetTranslation(pauseMenu->WidgetSwitcher_P2, 960.0f);
-        SetTranslation(pauseMenu->WBP_GadgetCustom_Sub_GadgetPlate_P2, 960.0f);
+    // ---------- Pause menu (2P): vanilla centred 16:9 window, shown whole on both monitors ----------
+    // (the old per-element moves double-shifted the gadget plates and pushed the buttons onto the bezel)
+    if (name.contains("WBP_PauseMenu_C") && bDualMenus && bIs2PlayerRace && g_bPixelDuplication) {
+        SPDLOG_INFO("HUD: Dual-Monitor pause menu -> centre window mirrored to both monitors");
+        RegisterSharedMenu(userWidget, userWidget, MenuKind::DupHigh);
     }
 
-    // ---------- Shared full-screen menus: original on Monitor 1, passive clone on Monitor 2 ----------
+    // ---------- Shared full-screen menus: centre 16:9 window shown on both monitors ----------
     if (bDualMenus && bIs2PlayerRace) {
         const bool bIsSharedMenu = name.contains("ClassSelect") ||
                                    name.contains("CourseSelect") ||
@@ -806,23 +1273,52 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
                                    name.contains("RivalCutin") ||
                                    name.contains("RivalChoice") ||
                                    name.contains("GrandPrixTips") ||
-                                   name.contains("RaceBefore");
+                                   name.contains("RaceBefore") ||
+                                   name.contains("Popup_Window_Hint");
 
-        auto widget = static_cast<SDK::UUserWidget*>(obj);
-        if (bIsSharedMenu && widget->WidgetTree && widget->WidgetTree->RootWidget && widget->Class) {
+        if (bIsSharedMenu && userWidget->WidgetTree && userWidget->WidgetTree->RootWidget && userWidget->Class) {
+            // Preferred: the Present hook copies the centre window to both monitors (real data, real animations)
+            if (g_bPixelDuplication) {
+                SPDLOG_INFO("HUD: Dual-Monitor shared menu {} -> centre window mirrored to both monitors", name);
+                RegisterSharedMenu(userWidget, userWidget, MenuKind::DupLow);
+                return;
+            }
+
+            // Fallback (D3D12 hooks unavailable): original on Monitor 1, passive clone on Monitor 2 (no game data)
+            userWidget->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
+            userWidget->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ -1920.0f, 0.0f });
             SPDLOG_INFO("HUD: Dual-Monitor shared menu duplicating for {}", name);
-            widget->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
-            // -1920 / +1920 design units = left / right monitor at this widget's DPI scale
-            widget->WidgetTree->RootWidget->SetRenderTranslation(SDK::FVector2D{ -1920.0f, 0.0f });
-
-            const std::string className = widget->Class->GetName();
-            if (auto clone = CreateMonitor2Clone(widget, widget->Class, 0, 1920.0f)) {
-                RegisterMenuClone(clone, widget, widget, className, false);
+            const std::string className = userWidget->Class->GetName();
+            if (auto clone = CreateMonitor2Clone(userWidget, userWidget->Class, 0, 1920.0f)) {
+                RegisterMenuClone(clone, userWidget, userWidget, className, false);
                 SPDLOG_INFO("HUD: Successfully duplicated {} to Monitor 2", className);
             }
         }
     }
 }
+
+// SEH safety net: a bad read (e.g. SDK layout drift after a game update) is logged instead of killing the game.
+// Kept free of C++ objects with destructors so __try is allowed here.
+static void LogWidgetHandlerCrash(SDK::UObject* obj, DWORD code)
+{
+    SPDLOG_ERROR("HUD: Widgets: exception 0x{:x} while processing widget @ 0x{:x} (last: {}). Skipped.",
+        code, reinterpret_cast<uintptr_t>(obj), sWidgetName);
+}
+
+static void SafeOnWidgetAddToViewport(SDK::UObject* obj)
+{
+    DWORD code = 0;
+    __try {
+        OnWidgetAddToViewport(obj);
+        return;
+    }
+    __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+    }
+    g_bIsMenuCloning = false;
+    g_CloneOpDepth = 0;
+    LogWidgetHandlerCrash(obj, code);
+}
+
 
 void HUD()
 {
@@ -946,7 +1442,7 @@ void HUD()
             UWidgetAddToViewportMidHook = safetyhook::create_mid(UWidgetAddToViewportScanResult,
                 [](SafetyHookContext& ctx) {
                     if (ctx.rdx)
-                        OnWidgetAddToViewport(reinterpret_cast<SDK::UObject*>(ctx.rdx));
+                        SafeOnWidgetAddToViewport(reinterpret_cast<SDK::UObject*>(ctx.rdx));
                 });
 
             // ProcessEvent runs every frame on the game thread: used to keep Monitor 2 clones in sync
@@ -963,6 +1459,9 @@ void HUD()
                 else {
                     SPDLOG_ERROR("HUD: Dual-Monitor clone sync: ProcessEvent offset unknown, clones will only be cleaned on menu changes.");
                 }
+
+                g_bPixelDuplication = InstallD3D12Hooks();
+                SPDLOG_INFO("HUD: Dual-Monitor shared menus: {}", g_bPixelDuplication ? "frame copy (D3D12 Present hook)" : "widget clones (fallback)");
             }
         }
         else {

@@ -6,7 +6,8 @@ set_languages("cxxlatest", "clatest")
 set_optimize("fastest")
 
 if is_mode("release") then
-    set_symbols("hidden")
+    -- keep a .pdb next to the .asi so crash offsets from the Windows event log can be resolved
+    set_symbols("debug")
     set_strip("all")
 else
     set_symbols("debug")
@@ -99,12 +100,12 @@ target(name)
     set_prefixname("")
     set_extension(".asi")
 
-    add_includedirs("src", "src/resources", "external/spdlog/include", "external/inipp", "external/safetyhook/include")
+    add_includedirs("src", "src/resources", "external", "external/spdlog/include", "external/inipp", "external/safetyhook/include")
     add_headerfiles("src/**.h", "src/**.hpp")
     add_files("src/*.cpp", "src/resources/version.rc", "external/safetyhook/src/**.cpp", "src/SDK/Basic.cpp", "src/SDK/CoreUObject_functions.cpp", "src/SDK/Engine_functions.cpp", "src/SDK/UMG_functions.cpp")
 
     add_deps("zydis")
-    add_syslinks("user32")
+    add_syslinks("user32", "d3d12", "dxgi")
 
     if is_plat("windows") then
         set_toolchains("msvc")
