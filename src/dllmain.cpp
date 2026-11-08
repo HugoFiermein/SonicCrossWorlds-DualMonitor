@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <atomic>
+#include <format>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
@@ -222,6 +223,112 @@ std::vector<SharedMenu> g_SharedMenus;
 std::atomic<bool> g_bDuplicateLeftHalf{ false };   // read on the RHI thread in Present
 bool g_bPixelDuplication = false;                   // D3D12 hooks installed
 
+// Per-player 2P screens shown on top of a shared menu (Ready "GO?" cards over course select):
+// while one of these is visible the frame copy is paused, otherwise it would paint over P2's half.
+struct DupBlocker
+{
+    SDK::UUserWidget* Owner = nullptr; int32_t OwnerIdx = -1;
+    SDK::UWidget* W = nullptr;         int32_t WIdx = -1;
+    bool bSeenInViewport = false;
+};
+std::vector<DupBlocker> g_DupBlockers;
+
+// Visible on screen = itself and every parent up to the owning UserWidget is visible and not transparent
+bool IsEffectivelyVisible(SDK::UWidget* w, SDK::UUserWidget* owner)
+{
+    int guard = 0;
+    for (SDK::UWidget* c = w; c && guard < 64; ++guard) {
+        auto v = c->Visibility;
+        if (v == SDK::ESlateVisibility::Collapsed || v == SDK::ESlateVisibility::Hidden || c->RenderOpacity < 0.01f)
+            return false;
+        if (!c->Slot) break;
+        c = c->Slot->Parent;
+    }
+    auto ov = owner->Visibility;
+    return ov != SDK::ESlateVisibility::Collapsed && ov != SDK::ESlateVisibility::Hidden && owner->RenderOpacity >= 0.01f;
+}
+
+void RegisterDupBlocker(SDK::UUserWidget* owner, SDK::UWidget* w)
+{
+    if (!owner || !w) return;
+    for (const auto& b : g_DupBlockers)
+        if (b.W == w) return;
+    g_DupBlockers.push_back({ owner, owner->Index, w, w->Index, false });
+}
+
+// ---------- Debug: widget tree dump ([Debug] DumpWidgetTrees = true) ----------
+bool bDumpWidgetTrees = false;
+struct PendingDump { SDK::UUserWidget* W; int32_t Idx; ULONGLONG Due; };
+std::vector<PendingDump> g_PendingDumps;
+
+static const char* VisName(SDK::ESlateVisibility v)
+{
+    switch (v) {
+    case SDK::ESlateVisibility::Visible: return "Vis";
+    case SDK::ESlateVisibility::Collapsed: return "Col";
+    case SDK::ESlateVisibility::Hidden: return "Hid";
+    case SDK::ESlateVisibility::HitTestInvisible: return "HTI";
+    case SDK::ESlateVisibility::SelfHitTestInvisible: return "SHTI";
+    default: return "?";
+    }
+}
+
+static void DumpWidget(SDK::UWidget* w, int depth, int& lines)
+{
+    if (!w || depth > 16 || lines > 2500) return;
+    ++lines;
+    std::string line(depth * 2, ' ');
+    line += w->GetName();
+    line += " <" + (w->Class ? w->Class->GetName() : std::string("?")) + ">";
+    line += std::format(" {} op={:.2f}", VisName(w->Visibility), w->RenderOpacity);
+    const auto& tr = w->RenderTransform.Translation;
+    if (tr.X != 0.0 || tr.Y != 0.0)
+        line += std::format(" tr=({:.0f},{:.0f})", tr.X, tr.Y);
+    if (w->Slot && w->Slot->IsA(SDK::UCanvasPanelSlot::StaticClass())) {
+        const auto& ld = static_cast<SDK::UCanvasPanelSlot*>(w->Slot)->LayoutData;
+        line += std::format(" A[{:.2f},{:.2f}-{:.2f},{:.2f}] O[{:.0f},{:.0f},{:.0f},{:.0f}] Al[{:.2f},{:.2f}]",
+            ld.Anchors.Minimum.X, ld.Anchors.Minimum.Y, ld.Anchors.Maximum.X, ld.Anchors.Maximum.Y,
+            ld.Offsets.Left, ld.Offsets.Top, ld.Offsets.Right, ld.Offsets.Bottom, ld.Alignment.X, ld.Alignment.Y);
+    }
+    if (w->IsA(SDK::USizeBox::StaticClass())) {
+        auto sb = static_cast<SDK::USizeBox*>(w);
+        line += std::format(" size={:.0f}x{:.0f}", sb->WidthOverride, sb->HeightOverride);
+    }
+    SPDLOG_INFO("DUMP {}", line);
+
+    if (w->IsA(SDK::UUserWidget::StaticClass())) {
+        auto uw = static_cast<SDK::UUserWidget*>(w);
+        if (uw->WidgetTree && uw->WidgetTree->RootWidget)
+            DumpWidget(uw->WidgetTree->RootWidget, depth + 1, lines);
+    }
+    else if (w->IsA(SDK::UPanelWidget::StaticClass())) {
+        auto p = static_cast<SDK::UPanelWidget*>(w);
+        for (int i = 0; i < p->Slots.Num(); ++i)
+            if (p->Slots[i] && p->Slots[i]->Content)
+                DumpWidget(p->Slots[i]->Content, depth + 1, lines);
+    }
+}
+
+void DumpWidgetTree(SDK::UUserWidget* uw, const char* when)
+{
+    SPDLOG_INFO("DUMP ===== {} ({}) =====", uw->GetName(), when);
+    int lines = 0;
+    DumpWidget(uw, 0, lines);
+    SPDLOG_INFO("DUMP ===== end ({} lines) =====", lines);
+}
+
+void ProcessPendingDumps()
+{
+    if (g_PendingDumps.empty()) return;
+    ULONGLONG now = GetTickCount64();
+    std::erase_if(g_PendingDumps, [now](PendingDump& d) {
+        if (now < d.Due) return false;
+        if (IsObjectAlive(d.W, d.Idx))
+            DumpWidgetTree(d.W, "2s after AddToViewport");
+        return true;
+    });
+}
+
 void UpdateSharedMenus(bool bCheckViewport)
 {
     CloneOpGuard guard;
@@ -237,12 +344,30 @@ void UpdateSharedMenus(bool bCheckViewport)
         return false;
     });
 
+    std::erase_if(g_DupBlockers, [bCheckViewport](DupBlocker& b) {
+        if (!IsObjectAlive(b.Owner, b.OwnerIdx) || !IsObjectAlive(b.W, b.WIdx))
+            return true;
+        if (bCheckViewport) {
+            if (b.Owner->IsInViewport())
+                b.bSeenInViewport = true;
+            else if (b.bSeenInViewport)
+                return true;
+        }
+        return false;
+    });
+
     bool bAnyVisible = false;
     if (bIs2PlayerRace && IsDualMonitorLayout()) {
         for (const auto& m : g_SharedMenus) {
             auto v = m.W->Visibility;
             if (v != SDK::ESlateVisibility::Collapsed && v != SDK::ESlateVisibility::Hidden) {
                 bAnyVisible = true;
+                break;
+            }
+        }
+        for (const auto& b : g_DupBlockers) {
+            if (bAnyVisible && IsEffectivelyVisible(b.W, b.Owner)) {
+                bAnyVisible = false;
                 break;
             }
         }
@@ -261,6 +386,7 @@ void RegisterSharedMenu(SDK::UUserWidget* w)
 void ClearSharedMenus()
 {
     g_SharedMenus.clear();
+    g_DupBlockers.clear();
     g_bDuplicateLeftHalf.store(false, std::memory_order_relaxed);
 }
 
@@ -288,7 +414,7 @@ void ProcessEvent_Hook(SDK::UObject* obj, SDK::UFunction* fn, void* parms)
     // unsafe_call: call() locks a mutex around the whole original, which would serialise every ProcessEvent in the game
     ProcessEventHook.unsafe_call<void>(obj, fn, parms);
 
-    if (g_CloneOpDepth > 0 || g_bIsMenuCloning || GetCurrentThreadId() != g_GameThreadId || (g_MenuClones.empty() && g_SharedMenus.empty()))
+    if (g_CloneOpDepth > 0 || g_bIsMenuCloning || GetCurrentThreadId() != g_GameThreadId || (g_MenuClones.empty() && g_SharedMenus.empty() && g_PendingDumps.empty()))
         return;
 
     static ULONGLONG lastViewportCheck = 0;
@@ -297,6 +423,8 @@ void ProcessEvent_Hook(SDK::UObject* obj, SDK::UFunction* fn, void* parms)
     if (bCheckViewport)
         lastViewportCheck = now;
     SafeSyncMenuClones(bCheckViewport);
+    if (bCheckViewport)
+        ProcessPendingDumps();
 }
 
 // Clears clipping and safe-zone padding on the whole tree and stretches only the OUTERMOST SizeBox
@@ -456,6 +584,7 @@ void Configuration()
     bDualMonitor2P = GetConfigAndLog(ini, "Dual Monitor Splitscreen", "Enabled", true);
     bHideCenterLine = GetConfigAndLog(ini, "Dual Monitor Splitscreen", "HideCenterDividerLine", true);
     bMirror2PMenus = GetConfigAndLog(ini, "Dual Monitor Splitscreen", "Mirror2PMenus", true);
+    bDumpWidgetTrees = GetConfigAndLog(ini, "Debug", "DumpWidgetTrees", false);
     
     SPDLOG_INFO("----------");
 }
@@ -923,6 +1052,18 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
         return;
     auto userWidget = static_cast<SDK::UUserWidget*>(obj);
 
+    if (bDumpWidgetTrees) {
+        static const char* kDumpFilter[] = { "_M2", "Race_HUD_Player", "PauseMenu", "CourseSelect", "ClassSelect",
+                                             "Rival", "RaceBefore", "Popup_Window_Hint", "Loading_BG", "Result" };
+        for (auto f : kDumpFilter) {
+            if (name.contains(f)) {
+                // Children created in Construct don't exist yet: dump again a bit later
+                g_PendingDumps.push_back({ userWidget, userWidget->Index, GetTickCount64() + 2000 });
+                break;
+            }
+        }
+    }
+
     const float widthOffset = (2160.0f * fAspectRatio - 3840.0f) / 2.0f;
     const float heightOffset = (3840.0f / fAspectRatio - 2160.0f) / 2.0f;
     const bool bDualLayout = IsDualMonitorLayout();
@@ -1016,8 +1157,10 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
         if (auto sizeBox = GetRootScaleBoxSizeBox(userWidget)) {
             // Resolution not known yet -> overriding with 0x0 would make the whole HUD vanish
             if ((bDualLayout || bSpanRaceHUD) && iCurrentResX > 0 && iCurrentResY > 0) {
-                sizeBox->SetWidthOverride(static_cast<float>(iCurrentResX));
-                sizeBox->SetHeightOverride(static_cast<float>(iCurrentResY));
+                // Keep the HUD's 2160-unit design height (scale 0.5 at 1080p, like 1P) and widen to the real aspect.
+                // Using the pixel resolution (3840x1080) here made the whole HUD twice as big and cut it off.
+                sizeBox->SetWidthOverride(2160.0f * fAspectRatio);
+                sizeBox->SetHeightOverride(2160.0f);
 
                 const SDK::FAnchors anchorsP1{ SDK::FVector2D{ 0.0, 0.0 }, SDK::FVector2D{ 0.5, 1.0 } };
                 const SDK::FAnchors anchorsP2{ SDK::FVector2D{ 0.5, 0.0 }, SDK::FVector2D{ 1.0, 1.0 } };
@@ -1113,8 +1256,10 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
             // Selection cards
             for (auto n : { "WBP_Ready_Sub_CharaWindow_P1P3", "WBP_Ready_Sub_Gadget_P1", "WBP_Window_MachineParameter_P1" })
                 SetTranslation(w[n], -960.0f, true);
-            for (auto n : { "WBP_Ready_Sub_CharaWindow_P2P4", "WBP_Ready_Sub_Gadget_P2", "WBP_Window_MachineParameter_P2" })
+            for (auto n : { "WBP_Ready_Sub_CharaWindow_P2P4", "WBP_Ready_Sub_Gadget_P2", "WBP_Window_MachineParameter_P2" }) {
                 SetTranslation(w[n], 960.0f, true);
+                RegisterDupBlocker(userWidget, w[n]);   // don't paint Monitor 1 over P2's card
+            }
 
             // Standby text and buttons on Monitor 1
             SetTranslation(w["WBP_Ready_Sub_StandByText"], -960.0f);
@@ -1180,7 +1325,8 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
                                    name.contains("RivalCutin") ||
                                    name.contains("RivalChoice") ||
                                    name.contains("GrandPrixTips") ||
-                                   name.contains("RaceBefore");
+                                   name.contains("RaceBefore") ||
+                                   name.contains("Popup_Window_Hint");
 
         if (bIsSharedMenu && userWidget->WidgetTree && userWidget->WidgetTree->RootWidget && userWidget->Class) {
             userWidget->WidgetTree->RootWidget->SetClipping(SDK::EWidgetClipping::Inherit);
