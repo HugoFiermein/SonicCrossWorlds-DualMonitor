@@ -1231,23 +1231,16 @@ void OnWidgetAddToViewport(SDK::UObject* obj)
         }
     }
 
-    // ---------- Per-player 2P screens (vanilla centred 16:9, P1 left half / P2 right half) ----------
-    // Rendered untouched; the Present hook moves each half onto its player's monitor (FrameMode::Split).
-    const bool bIsSplitScreen = name.contains("WBP_MachineCharaSelect_M2") ||
-                                name.contains("GadgetCutom_M2") || name.contains("GadgetCustom_M2") ||
-                                name.contains("WBP_Result_GP_Player0204");
-    if (bIsSplitScreen) {
+    // ---------- Per-player 2P screens (chara/machine select, gadgets, GP results) ----------
+    // Vanilla centred 16:9 window, shown whole on both monitors like every other 2P menu.
+    const bool bIsPlayerScreen = name.contains("WBP_MachineCharaSelect_M2") ||
+                                 name.contains("GadgetCutom_M2") || name.contains("GadgetCustom_M2") ||
+                                 name.contains("WBP_Result_GP_Player0204");
+    if (bIsPlayerScreen) {
         bIs2PlayerRace = true;
         if (bDualMenus && g_bPixelDuplication) {
-            SPDLOG_INFO("HUD: Dual-Monitor per-player screen {} -> split across monitors", name);
-            RegisterSharedMenu(userWidget, userWidget, MenuKind::Split);
-
-            // The character grid sits in the middle of the window, over both halves: while it is shown,
-            // show the whole window on both monitors instead of cutting the grid in two
-            if (name.contains("WBP_MachineCharaSelect_M2")) {
-                WidgetIndex w(userWidget);
-                RegisterSharedMenu(w["WBP_CharaSelect_Sub_Window"], userWidget, MenuKind::DupHigh);
-            }
+            SPDLOG_INFO("HUD: Dual-Monitor 2P screen {} -> centre window mirrored to both monitors", name);
+            RegisterSharedMenu(userWidget, userWidget, MenuKind::DupLow);
         }
     }
 
